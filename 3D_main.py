@@ -16,7 +16,8 @@ from fcc_lib import (
     structured_mesh_from_fcc_plane,
     calculate_rss_and_activity,
     reconstruct_active_slip_planes,
-    generate_dislocation_loops_per_system
+    generate_dislocation_loops_per_system,
+    compute_dislocation_density_maps
 )
 
 # =============================================================================
@@ -35,13 +36,13 @@ from fcc_lib import (
 # =============================================================================
 print("--- 1. Setting up parameters ---")
 b = 2.56*(10**-10)  # Lattice constant (e.g., for Copper in Angstroms)
-target_density= 10**9
+target_density= 10**11
 d = 500*b
 CRSS = .5*10**6
 app_load = 20*10**6
 load_direction= np.array([0, 0, 1])
 b_vecs = calculate_tetrahedron_slip_systems(b)
-box_edge_length = 5000 * b
+box_edge_length = 20000 * b
 n_grid = np.ceil(box_edge_length / d)
 # =============================================================================
 # 2. EXECUTE COMPUTATIONAL STEPS
@@ -120,5 +121,37 @@ rss, active_s =calculate_rss_and_activity(load_direction, app_load, CRSS, b_vecs
 nodes_active= reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ)
 ##############################
 # now we will make the dislocation loops
-loops = generate_dislocation_loops_per_system(active_s, node_on_slip_sys, XX, YY, ZZ, b_vecs,
-                                          target_density, 600*b, 6000*b, b, box_edge_length)
+
+# 1. Generate Loops (Pass nodes_active to filter valid stacks)
+loops = generate_dislocation_loops_per_system(
+    active_s,
+    node_on_slip_sys,
+    nodes_active,  # <--- NEW ARGUMENT
+    XX, YY, ZZ,
+    b_vecs,
+    target_density,
+    600*b,
+    6000*b,
+    b,
+    box_edge_length
+)
+
+# 2. Compute Density Maps
+from fcc_lib import compute_dislocation_density_maps
+
+QQ = compute_dislocation_density_maps(
+    loops,
+    nodes_active,
+    b,
+    std_dev_mult=600,
+    cutoff_mult=5
+)
+
+# Optional: Visualize one result
+if QQ:
+    import matplotlib.pyplot as plt
+    first_loop = list(QQ.values())[0]
+    plt.imshow(first_loop['density_map'], origin='lower')
+    plt.title("Dislocation Density Map")
+    plt.colorbar()
+    plt.show()

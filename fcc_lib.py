@@ -3,7 +3,7 @@ import random
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-
+from scipy.spatial import cKDTree
 import numpy as np
 
 
@@ -573,126 +573,224 @@ def reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ):
     return reconstructed_nodes
 
 
-import random
-import numpy as np
 
 
-def generate_dislocation_loops_per_system(active_s, node_on_slip_sys, XX, YY, ZZ, b_vecs,
+def generate_dislocation_loops_per_system(active_s, node_on_slip_sys, nodes_active, XX, YY, ZZ, b_vecs,
                                           target_density, min_size_m, max_size_m, b, box_length_m):
     """
-    Generates loops for EACH active slip system until that specific system
-    reaches the target density.
-
-    Units: ALL inputs are expected in METERS (SI Units).
+    Generates loops ONLY on slip planes that have successfully generated meshes.
     """
-
     generated_loops = []
 
-    # 1. Calculate Target Length in METERS
-    # Volume = L^3
-    real_volume_m3 = box_length_m ** 3
+    # 1. Identify Valid Stacks from nodes_active
+    # We create a set of (normal_id, stack_id) that actually have meshes.
+    valid_stacks_set = set()
+    for node in nodes_active:
+        n_id = int(node['slip_plane_normal_id'])
+        s_id = int(node['slip_plane_stack_id'])
+        valid_stacks_set.add((n_id, s_id))
 
-    # Target Length (m) = Density (m^-2) * Volume (m^3)
+    real_volume_m3 = box_length_m ** 3
     target_length_per_system_m = target_density * real_volume_m3
 
-    print(f"--- Generation Stats ---")
-    print(f"Box Volume: {real_volume_m3:.3e} m^3")
-    print(f"Target Total Length per System: {target_length_per_system_m:.3e} m")
+    print(f"--- Generating Loops (Target Length: {target_length_per_system_m:.2e} m) ---")
 
-    # 2. Organize stacks for easy access
-    stacks_by_normal = {0: [], 1: [], 2: [], 3: []}
-    for (n_id, s_id) in node_on_slip_sys.keys():
-        if n_id in stacks_by_normal:
-            stacks_by_normal[n_id].append(s_id)
-
-    for n_id in stacks_by_normal:
-        stacks_by_normal[n_id] = sorted(list(set(stacks_by_normal[n_id])))
-
-    # 3. Iterate through all 12 slip systems
+    # 2. Iterate through all 12 slip systems
     for n_idx in range(4):
         for d_idx in range(3):
-
-            # Check if this specific system is active
             if active_s[n_idx, d_idx] == 1:
 
-                current_system_length_m = 0.0
+                # Get all potential stacks for this normal
+                potential_stacks = []
+                # Check keys in node_on_slip_sys matching this normal
+                for (k_n, k_s) in node_on_slip_sys.keys():
+                    if k_n == n_idx:
+                        potential_stacks.append(k_s)
 
-                available_stacks = stacks_by_normal[n_idx]
+                potential_stacks = list(set(potential_stacks))
+
+                # FILTER: Only keep stacks that exist in valid_stacks_set
+                available_stacks = [s for s in potential_stacks if (n_idx, s) in valid_stacks_set]
+
                 if not available_stacks:
+                    print(f"  > System ({n_idx}, {d_idx}) Active, but no valid meshes found. Skipping.")
                     continue
 
-                # Get vectors
+                current_system_length_m = 0.0
                 normal_vec = b_vecs[n_idx, d_idx, 0, :]
                 burgers_vec = b_vecs[n_idx, d_idx, 1, :]
                 normal_vec = normal_vec / np.linalg.norm(normal_vec)
 
-                # --- 4. Generate Loops until length requirement is met ---
+                # 3. Generate Loops
                 while current_system_length_m < target_length_per_system_m:
-
-                    # A. Pick a random stack and a random point on it
                     stack_id = random.choice(available_stacks)
                     indices = node_on_slip_sys.get((n_idx, stack_id))
-                    if not indices:
-                        continue
 
                     rand_pt_idx = random.choice(indices)
                     i, j, k = rand_pt_idx
                     center_point = np.array([XX[i, j, k], YY[i, j, k], ZZ[i, j, k]])
 
-                    # B. Define local coordinate system (u, v) on the plane
+                    # Local coords
                     if np.abs(normal_vec[2]) < 0.9:
                         helper = np.array([0, 0, 1])
                     else:
                         helper = np.array([1, 0, 0])
 
                     u_vec = np.cross(normal_vec, helper)
-                    u_vec = u_vec / np.linalg.norm(u_vec)
+                    u_vec /= np.linalg.norm(u_vec)
                     v_vec = np.cross(normal_vec, u_vec)
-                    v_vec = v_vec / np.linalg.norm(v_vec)
+                    v_vec /= np.linalg.norm(v_vec)
 
-                    # C. Determine size (Inputs are already in Meters)
+                    # Size and Rotation
                     a_m = random.uniform(min_size_m, max_size_m)
                     c_m = random.uniform(min_size_m, max_size_m)
-
                     rotation_angle = random.uniform(0, 2 * np.pi)
 
-                    # D. Generate discrete points
-                    # 60 points, 0 to 2pi. The last point equals the first point to close the loop.
                     theta = np.linspace(0, 2 * np.pi, 61)
-
                     x_local = a_m * np.cos(theta)
                     y_local = c_m * np.sin(theta)
 
-                    # Rotate in 2D
                     x_rot = x_local * np.cos(rotation_angle) - y_local * np.sin(rotation_angle)
                     y_rot = x_local * np.sin(rotation_angle) + y_local * np.cos(rotation_angle)
 
-                    # Transform to 3D
-                    # shape: (61, 3)
-                    loop_segments = (center_point +
-                                     np.outer(x_rot, u_vec) +
-                                     np.outer(y_rot, v_vec))
+                    loop_segments = (center_point + np.outer(x_rot, u_vec) + np.outer(y_rot, v_vec))
 
-                    # E. Calculate EXACT discrete length
-                    # Vector difference between consecutive points
+                    # Length calculation
                     segment_vectors = loop_segments[1:] - loop_segments[:-1]
-                    # Length of each segment
-                    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
-                    # Sum
-                    actual_loop_length = np.sum(segment_lengths)
-
+                    actual_loop_length = np.sum(np.linalg.norm(segment_vectors, axis=1))
                     current_system_length_m += actual_loop_length
 
                     loop_data = {
                         "normal_id": int(n_idx),
                         "slip_system_id": int(d_idx),
                         "stack_id": int(stack_id),
-                        "segments": loop_segments,  # The points
+                        "segments": loop_segments,
                         "burgers_vector": burgers_vec
                     }
                     generated_loops.append(loop_data)
 
-                print(
-                    f"  > System ({n_idx}, {d_idx}) Active. Generated {current_system_length_m:.2e} m (Target: {target_length_per_system_m:.2e} m)")
+                print(f"  > System ({n_idx}, {d_idx}) Generated {current_system_length_m:.2e} m")
 
     return generated_loops
+
+#############################################
+
+
+
+def compute_dislocation_density_maps(generated_loops, nodes_active, b,
+                                     std_dev_mult=600, cutoff_mult=5):
+    """
+    Smears discrete dislocation loops onto the active slip plane meshes using
+    a Gaussian distribution.
+    """
+    print("\n--- Computing Gaussian Smearing for Dislocation Density ---")
+
+    sigma = std_dev_mult * b
+    cutoff_radius = cutoff_mult * sigma
+    two_sigma_sq = 2 * sigma ** 2
+    # Normalization factor: ensures the integral of density equals the line length
+    norm_factor = 1.0 / (2 * np.pi * sigma ** 2)
+
+    # --- 1. Pre-build KDTrees for every active mesh ---
+    mesh_acceleration_structures = {}
+
+    print(f"Building search trees for {len(nodes_active)} active meshes...")
+
+    for mesh_idx, mesh_data in enumerate(nodes_active):
+        # Force cast to standard python int to avoid numpy int32/int64 mismatches
+        n_id = int(mesh_data['slip_plane_normal_id'])
+        s_id = int(mesh_data['slip_plane_stack_id'])
+
+        X = mesh_data['x_grid']
+        Y = mesh_data['y_grid']
+        Z = mesh_data['z_grid']
+
+        # Only build tree on valid points (not NaNs)
+        valid_mask = ~np.isnan(X)
+        valid_indices = np.argwhere(valid_mask)  # (row, col) indices
+
+        valid_coords = np.column_stack((
+            X[valid_mask],
+            Y[valid_mask],
+            Z[valid_mask]
+        ))
+
+        if len(valid_coords) == 0:
+            continue
+
+        tree = cKDTree(valid_coords)
+
+        mesh_acceleration_structures[(n_id, s_id)] = {
+            'tree': tree,
+            'indices_map': valid_indices,
+            'shape': X.shape
+        }
+
+    # --- 2. Iterate over loops and compute density ---
+    QQ = {}
+    missing_mesh_count = 0
+
+    for loop_idx, loop in enumerate(generated_loops):
+        n_id = int(loop['normal_id'])
+        s_id = int(loop['stack_id'])
+
+        # Check if we have a mesh for this loop's plane
+        if (n_id, s_id) not in mesh_acceleration_structures:
+            missing_mesh_count += 1
+            continue
+
+        struct = mesh_acceleration_structures[(n_id, s_id)]
+        tree = struct['tree']
+        indices_map = struct['indices_map']
+        grid_shape = struct['shape']
+
+        # Initialize Density Map
+        density_map = np.zeros(grid_shape)
+
+        points = loop['segments']
+
+        # Calculate segment vectors, lengths, and centers
+        # Vector from point i to i+1
+        vecs = points[1:] - points[:-1]
+        lengths = np.linalg.norm(vecs, axis=1)
+        centers = (points[1:] + points[:-1]) / 2.0
+
+        # --- 3. Smear each segment ---
+        for i, center in enumerate(centers):
+            seg_len = lengths[i]
+
+            # Find mesh nodes within cutoff radius
+            neighbor_indices = tree.query_ball_point(center, cutoff_radius)
+
+            if not neighbor_indices:
+                continue
+
+            # Get coordinates of these neighbors
+            neighbor_coords = tree.data[neighbor_indices]
+
+            # Calculate Gaussian weights
+            diff = neighbor_coords - center
+            dist_sq = np.sum(diff ** 2, axis=1)
+
+            # Weight = Length * Gaussian_Value
+            weights = (seg_len * norm_factor) * np.exp(-dist_sq / two_sigma_sq)
+
+            # Map back to 2D grid
+            for k, tree_idx in enumerate(neighbor_indices):
+                r, c = indices_map[tree_idx]
+                density_map[r, c] += weights[k]
+
+        QQ[loop_idx] = {
+            "density_map": density_map,
+            "burgers_vector": loop['burgers_vector'],
+            "normal_id": n_id,
+            "stack_id": s_id,
+            "slip_system_id": int(loop['slip_system_id'])
+        }
+
+    if missing_mesh_count > 0:
+        print(f"Warning: {missing_mesh_count} loops were skipped because their slip plane mesh was missing.")
+        print("Ensure 'generate_dislocation_loops_per_system' only picks stacks present in 'nodes_active'.")
+
+    print(f"Density mapping complete. Generated maps for {len(QQ)} loops.")
+    return QQ
