@@ -17,7 +17,8 @@ from fcc_lib import (
     calculate_rss_and_activity,
     reconstruct_active_slip_planes,
     generate_dislocation_loops_per_system,
-    compute_dislocation_density_maps
+    compute_density_and_theta_maps
+
 )
 
 # =============================================================================
@@ -44,6 +45,7 @@ load_direction= np.array([0, 0, 1])
 b_vecs = calculate_tetrahedron_slip_systems(b)
 box_edge_length = 20000 * b
 n_grid = np.ceil(box_edge_length / d)
+nthetaintervals = 360  # Example: Divide 0-360 degrees into 18 bins (20 degrees each)
 # =============================================================================
 # 2. EXECUTE COMPUTATIONAL STEPS
 # =============================================================================
@@ -137,21 +139,42 @@ loops = generate_dislocation_loops_per_system(
 )
 
 # 2. Compute Density Maps
-from fcc_lib import compute_dislocation_density_maps
 
-QQ = compute_dislocation_density_maps(
+# 2. Compute 3D Density/Theta Maps
+
+
+QQ = compute_density_and_theta_maps(
     loops,
     nodes_active,
     b,
+    nthetaintervals=nthetaintervals,  # Pass the new parameter
     std_dev_mult=600,
     cutoff_mult=5
 )
 
-# Optional: Visualize one result
+# Optional: Inspect the result
 if QQ:
+    first_loop_key = list(QQ.keys())[0]
+    data = QQ[first_loop_key]
+    d_map = data['density_map']
+
+    print(f"Loop {first_loop_key} Map Shape: {d_map.shape}")
+    # Shape should be (nx, ny, 18)
+
+    # To see total density (summed over all angles):
+    total_density = np.sum(d_map, axis=2)
+
     import matplotlib.pyplot as plt
-    first_loop = list(QQ.values())[0]
-    plt.imshow(first_loop['density_map'], origin='lower')
-    plt.title("Dislocation Density Map")
+
+    plt.figure()
+    plt.imshow(total_density, origin='lower')
+    plt.title("Total Dislocation Density (Summed over Theta)")
+    plt.colorbar()
+    plt.show()
+
+    # To see density of a specific angle bin (e.g., bin 0, 0-20 degrees):
+    plt.figure()
+    plt.imshow(d_map[:, :, 0], origin='lower')
+    plt.title(f"Density for Theta Bin 0 (approx 0-{360 / nthetaintervals:.1f} deg)")
     plt.colorbar()
     plt.show()

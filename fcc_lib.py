@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial import cKDTree
 import numpy as np
-
+from scipy.spatial.distance import cdist
 
 def generate_grid(b, d, box_edge_length):
     """
@@ -287,124 +287,6 @@ def visualize_planes(XX, YY, ZZ, box_mask, slip_plane_ids, target_normal_idx):
 import numpy as np
 
 
-def structured_mesh_from_fcc_plane(points, tolerance=1e-15):
-    """
-    Takes a list of 3D points lying on an FCC plane (hexagonal lattice)
-    and maps them to structured 2D arrays (X, Y, Z).
-
-    Enforces a 120-degree angle between basis vectors a1 and a2.
-
-    Returns:
-        grid_X, grid_Y, grid_Z, a1, a2
-    """
-    points = np.array(points)
-    n_points = points.shape[0]
-
-    if n_points < 3:
-        raise ValueError("Need at least 3 points to define a plane and basis.")
-
-    # --- Step 1: Define the Origin ---
-    origin = points[0]
-
-    # --- Step 2: Find Basis Vectors ---
-    diffs = points - origin
-    dists = np.linalg.norm(diffs, axis=1)
-
-    # Filter out the origin itself
-    valid_indices = np.where(dists > tolerance)[0]
-
-    if len(valid_indices) == 0:
-        raise ValueError("All points are the same.")
-
-    # Find the distance to the nearest neighbor
-    min_dist = np.min(dists[valid_indices])
-
-    # Get all points that are approximately at 'min_dist' distance
-    neighbor_indices = valid_indices[np.abs(dists[valid_indices] - min_dist) < tolerance]
-
-    if len(neighbor_indices) < 2:
-        raise ValueError("Could not find enough neighbors to form a basis.")
-
-    # Pick the first basis vector
-    idx_a1 = neighbor_indices[0]
-    a1 = points[idx_a1] - origin
-
-    # Pick the second basis vector
-    a2 = None
-    for idx in neighbor_indices:
-        candidate = points[idx] - origin
-        # Check cross product to ensure they are not collinear
-        cross_prod = np.cross(a1, candidate)
-        if np.linalg.norm(cross_prod) > tolerance:
-            a2 = candidate
-            break
-
-    if a2 is None:
-        raise ValueError("Could not find a second independent basis vector.")
-
-    # --- Step 2.5: Enforce 120 Degree Angle ---
-
-    # Calculate current angle
-    unit_a1 = a1 / np.linalg.norm(a1)
-    unit_a2 = a2 / np.linalg.norm(a2)
-    dot_product = np.dot(unit_a1, unit_a2)
-    angle_rad = np.arccos(np.clip(dot_product, -1.0, 1.0))
-    angle_deg = np.degrees(angle_rad)
-
-    print(f"Initial angle found: {angle_deg:.2f} degrees")
-
-    # If angle is approx 60 degrees (allowing for small float errors), flip a2
-    if abs(angle_deg - 60.0) < 5.0:
-        print("Angle is ~60 degrees. Flipping a2 to achieve 120 degrees.")
-        a2 = -a2
-        # Recalculate angle for verification
-        unit_a2 = a2 / np.linalg.norm(a2)
-        dot_product = np.dot(unit_a1, unit_a2)
-        angle_deg = np.degrees(np.arccos(np.clip(dot_product, -1.0, 1.0)))
-
-    print(f"Final Basis used:\n a1: {a1}\n a2: {a2}")
-    print(f"Final Angle: {angle_deg:.2f} degrees")
-
-    # --- Step 3: Solve for Lattice Coordinates (u, v) ---
-    # We use the (possibly flipped) a1 and a2 here
-    Basis = np.column_stack((a1, a2))
-    P_rel = (points - origin).T
-
-    # Solve Basis * [u, v] = P_rel
-    uv_coords, residuals, rank, s = np.linalg.lstsq(Basis, P_rel, rcond=None)
-    uv_int = np.round(uv_coords).astype(int)
-
-    # Sanity check reconstruction
-    reconstructed = (Basis @ uv_coords).T + origin
-    error = np.linalg.norm(points - reconstructed)
-    if error > tolerance * n_points:
-        print(f"Warning: High reconstruction error ({error}).")
-
-    u_vals = uv_int[0, :]
-    v_vals = uv_int[1, :]
-
-    # --- Step 4: Create the Structured Grid ---
-    u_min, u_max = np.min(u_vals), np.max(u_vals)
-    v_min, v_max = np.min(v_vals), np.max(v_vals)
-
-    dim_u = u_max - u_min + 1
-    dim_v = v_max - v_min + 1
-
-    print(f"Grid dimensions: {dim_u} x {dim_v}")
-
-    grid_X = np.full((dim_u, dim_v), np.nan)
-    grid_Y = np.full((dim_u, dim_v), np.nan)
-    grid_Z = np.full((dim_u, dim_v), np.nan)
-
-    for k in range(n_points):
-        i = u_vals[k] - u_min
-        j = v_vals[k] - v_min
-        grid_X[i, j] = points[k, 0]
-        grid_Y[i, j] = points[k, 1]
-        grid_Z[i, j] = points[k, 2]
-
-    # Return grids AND the corrected basis vectors
-    return grid_X, grid_Y, grid_Z, a1, a2
 
 
 def get_fcc_slip_systems():
@@ -442,6 +324,151 @@ def get_fcc_slip_systems():
             systems_array[i, j, 1, :] = directions[i][j]  # Store Direction b
 
     return systems_array
+
+def structured_mesh_from_fcc_plane(points, tolerance=1e-15):
+    """
+    Reconstructs a structured grid from a cloud of points on an FCC plane.
+
+    Algorithm:
+    1. Discard if nodes < 5.
+    2. Find nearest neighbor distance (d).
+    3. Find two neighbors forming a 120-degree angle to define basis vectors (a1, a2).
+    4. Scan/Map all points to integer coordinates (n1, n2) using this basis.
+    5. Create a grid from min(n) to max(n) and fill missing spots with NaN (Null).
+    """
+
+    num_points = len(points)
+
+    # --- FILTER: Discard small stacks ---
+    if num_points < 5:
+        return None, None, None, None, None
+
+    # --- Step 1: Determine Basis Vectors (a1, a2) ---
+    a1 = None
+    a2 = None
+
+    # Calculate nearest neighbor distance (d)
+    # We use a subset for speed, assuming homogeneous lattice
+    subset = points[:min(50, num_points)]
+    dists = cdist(subset, subset)
+    valid_dists = dists[dists > 1e-8]  # Exclude self-distance (0)
+
+    if len(valid_dists) == 0:
+        return None, None, None, None, None
+
+    nn_dist = np.min(valid_dists)
+
+    # Search for basis vectors with 120 degree separation
+    found_basis = False
+
+    # Try the first few points as potential origins to find a valid basis
+    for i in range(min(10, num_points)):
+        p0 = points[i]
+
+        # Find neighbors within tolerance of d
+        dist_from_p0 = np.linalg.norm(points - p0, axis=1)
+        # 5% tolerance for thermal noise or numerical float errors
+        neighbor_indices = np.where((dist_from_p0 > nn_dist * 0.95) &
+                                    (dist_from_p0 < nn_dist * 1.05))[0]
+
+        if len(neighbor_indices) < 2:
+            continue
+
+        neighbors = points[neighbor_indices]
+        vecs = neighbors - p0
+
+        # Normalize for angle calculation
+        norms = np.linalg.norm(vecs, axis=1)
+        unit_vecs = vecs / norms[:, np.newaxis]
+
+        # Check angles between pairs of neighbors
+        for j in range(len(unit_vecs)):
+            for k in range(j + 1, len(unit_vecs)):
+                dot_prod = np.dot(unit_vecs[j], unit_vecs[k])
+
+                # cos(120) = -0.5.
+                # We check range [-0.6, -0.4] to be safe.
+                if -0.6 < dot_prod < -0.4:
+                    a1 = vecs[j]
+                    a2 = vecs[k]
+                    found_basis = True
+                    break
+            if found_basis: break
+        if found_basis: break
+
+    # Fallback: If 120 not found (e.g., at edges), try 60 degrees and flip vector
+    if not found_basis:
+        for i in range(min(10, num_points)):
+            p0 = points[i]
+            dist_from_p0 = np.linalg.norm(points - p0, axis=1)
+            neighbor_indices = np.where((dist_from_p0 > nn_dist * 0.95) &
+                                        (dist_from_p0 < nn_dist * 1.05))[0]
+            if len(neighbor_indices) < 2: continue
+
+            neighbors = points[neighbor_indices]
+            vecs = neighbors - p0
+            unit_vecs = vecs / np.linalg.norm(vecs, axis=1)[:, np.newaxis]
+
+            for j in range(len(unit_vecs)):
+                for k in range(j + 1, len(unit_vecs)):
+                    dot_prod = np.dot(unit_vecs[j], unit_vecs[k])
+                    # cos(60) = 0.5
+                    if 0.4 < dot_prod < 0.6:
+                        a1 = vecs[j]
+                        a2 = vecs[k]
+                        # Construct 120 basis from 60 basis: a2_new = a2_old - a1
+                        a2 = a2 - a1
+                        found_basis = True
+                        break
+                if found_basis: break
+            if found_basis: break
+
+    if not found_basis:
+        return None, None, None, None, None
+
+    # --- Step 2: Scan/Map points to integer indices (n1, n2) ---
+    # We solve P = Origin + n1*a1 + n2*a2 for n1, n2
+
+    M = np.column_stack((a1, a2))  # Matrix [a1, a2]
+    origin = points[0]  # Arbitrary origin for the grid
+    P_rel = (points - origin).T
+
+    # Linear Least Squares to find indices
+    # (M^T M)^-1 M^T * P_rel
+    coeffs = np.linalg.inv(M.T @ M) @ M.T @ P_rel
+
+    indices = np.round(coeffs).astype(int)
+    n1_vals = indices[0, :]
+    n2_vals = indices[1, :]
+
+    # Validation: Check if points actually fall on grid nodes
+    reconstructed_points = (M @ indices).T + origin
+    errors = np.linalg.norm(points - reconstructed_points, axis=1)
+    if np.max(errors) > nn_dist * 0.1:
+        # Points do not fit this basis well
+        return None, None, None, None, None
+
+    # --- Step 3: Create Grid and Fill ---
+    n1_min, n1_max = np.min(n1_vals), np.max(n1_vals)
+    n2_min, n2_max = np.min(n2_vals), np.max(n2_vals)
+
+    dim1 = n1_max - n1_min + 1
+    dim2 = n2_max - n2_min + 1
+
+    # Initialize with Null (NaN)
+    x_grid = np.full((dim1, dim2), np.nan)
+    y_grid = np.full((dim1, dim2), np.nan)
+    z_grid = np.full((dim1, dim2), np.nan)
+
+    # Map indices to 0-based array coordinates
+    idx_1 = n1_vals - n1_min
+    idx_2 = n2_vals - n2_min
+
+    x_grid[idx_1, idx_2] = points[:, 0]
+    y_grid[idx_1, idx_2] = points[:, 1]
+    z_grid[idx_1, idx_2] = points[:, 2]
+
+    return x_grid, y_grid, z_grid, a1, a2
 
 
 def calculate_rss_and_activity(loading_dir, load_val, crss, slip_systems):
@@ -498,7 +525,9 @@ def calculate_rss_and_activity(loading_dir, load_val, crss, slip_systems):
     return rss_matrix, activity_matrix
 
 
-import numpy as np
+
+
+
 
 
 def reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ):
@@ -506,69 +535,75 @@ def reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ):
     Reconstructs specific slip plane instances based on active slip systems.
 
     Args:
-        active_s (list or np.ndarray): List of active systems [[plane_type, dir_id], ...].
-        node_on_slip_sys (dict): Mapping {(plane_type, stack_id): [[i, j, k], ...]}.
-        XX, YY, ZZ (np.ndarray): 3D coordinate arrays.
+        active_s: List or Matrix of active systems.
+        node_on_slip_sys: Dictionary {(plane_type, stack_id): [indices]}.
+        XX, YY, ZZ: 3D coordinate arrays.
 
     Returns:
-        list: A list of dictionaries containing grid data and specific IDs.
+        List of dictionaries containing grid data and requested IDs.
     """
 
-    # 1. Create a map of Active Directions for each Plane Normal Type (0-3)
-    # Structure: { 0: {1, 2}, 1: {0}, ... }
+    # 1. Parse Active Systems into a Map
+    # Structure: { plane_type_id: {dir_id_1, dir_id_2}, ... }
     active_map = {}
-    for sys in active_s:
-        p_type = int(sys[0])
-        d_id = int(sys[1])
-        active_map.setdefault(p_type, set()).add(d_id)
+
+    # Handle numpy array input (common in previous steps)
+    if isinstance(active_s, np.ndarray):
+        rows, cols = active_s.shape
+        for p_type in range(rows):
+            for d_id in range(cols):
+                if active_s[p_type, d_id] == 1:
+                    active_map.setdefault(p_type, set()).add(d_id)
+    # Handle list input [[plane, dir], ...]
+    else:
+        for sys in active_s:
+            p_type = int(sys[0])
+            d_id = int(sys[1])
+            active_map.setdefault(p_type, set()).add(d_id)
 
     reconstructed_nodes = []
 
-    # 2. Iterate through every specific plane instance found in the dictionary
-    # Key format from your code: (plane_type, stack_id)
+    # 2. Iterate through every specific plane instance found
     for (p_type, p_stack_id), indices_list in node_on_slip_sys.items():
 
-        # Only reconstruct if this plane type is in the active list
+        # Only process if this plane type is active
         if p_type in active_map:
 
-            # Convert list of indices to numpy array for vectorization
             ids = np.array(indices_list)
 
-            if ids.shape[0] == 0:
+            # Pre-check: strictly less than 5 nodes are ignored
+            if ids.shape[0] < 5:
                 continue
 
-            # --- Vectorized Coordinate Extraction ---
-            # Extract u, v, w indices columns
+            # Extract 3D coordinates
             u, v, w = ids[:, 0], ids[:, 1], ids[:, 2]
-
-            # Create (N, 3) points array
             points = np.column_stack((XX[u, v, w], YY[u, v, w], ZZ[u, v, w]))
 
-            # --- Generate Mesh ---
             try:
-                # FIX APPLIED HERE:
-                # Changed tolerance from 1e-5 to 1e-12.
-                # Since your b is ~3e-9, points are separated by ~1e-9.
-                # A tolerance of 1e-5 makes them look like the same point.
-                # A tolerance of 1e-12 allows the code to distinguish them.
-                x_grid, y_grid, z_grid, a_1, a_2 = structured_mesh_from_fcc_plane(points, tolerance=1e-14)
+                # Generate Mesh using the specific algorithm
+                x_grid, y_grid, z_grid, a_1, a_2 = structured_mesh_from_fcc_plane(points)
 
-                # Construct the result dictionary with the requested IDs
+                # If None, it means mesh construction failed (e.g. no valid basis found)
+                if x_grid is None:
+                    continue
+
+                # Construct the result dictionary with ALL requested IDs
                 plane_data = {
                     "x_grid": x_grid,
                     "y_grid": y_grid,
                     "z_grid": z_grid,
                     "a_1": a_1,
                     "a_2": a_2,
-                    "slip_plane_normal_id": p_type,  # 0, 1, 2, or 3
-                    "slip_plane_stack_id": p_stack_id,  # The ID in the stack
+                    # Requested Output IDs:
+                    "slip_plane_normal_id": p_type,  # The Plane Type (0-3)
+                    "slip_plane_stack_id": p_stack_id,  # The Stack ID
                     "active_slip_system_ids": list(active_map[p_type])  # List of active directions
                 }
 
                 reconstructed_nodes.append(plane_data)
 
             except Exception as e:
-                print(f"Skipping plane ({p_type}, {p_stack_id}) due to mesh error: {e}")
+                print(f"Skipping plane ({p_type}, {p_stack_id}) due to error: {e}")
 
     return reconstructed_nodes
 
@@ -676,14 +711,34 @@ def generate_dislocation_loops_per_system(active_s, node_on_slip_sys, nodes_acti
 #############################################
 
 
+# fcc_lib.py
 
-def compute_dislocation_density_maps(generated_loops, nodes_active, b,
-                                     std_dev_mult=600, cutoff_mult=5):
+def compute_density_and_theta_maps(generated_loops, nodes_active, b,
+                                   nthetaintervals, std_dev_mult=600, cutoff_mult=5):
     """
-    Smears discrete dislocation loops onto the active slip plane meshes using
-    a Gaussian distribution.
+    Computes a combined Dislocation Density and Theta map.
+
+    Instead of a simple 2D density map, this function produces a 3D array where the
+    density is binned by the orientation angle (theta) of the dislocation line relative
+    to its Burgers vector.
+
+    Args:
+        generated_loops: List of loop data dictionaries.
+        nodes_active: List of mesh data dictionaries.
+        b: Burgers vector magnitude.
+        nthetaintervals (int): Number of intervals to divide the 0-2pi (0-360 deg) range.
+        std_dev_mult: Multiplier for Gaussian sigma.
+        cutoff_mult: Multiplier for cutoff radius.
+
+    Returns:
+        QQ (dict): Dictionary keyed by loop index containing:
+            - "density_map": nd.array of shape (nx, ny, nthetaintervals)
+            - "normal_id"
+            - "stack_id"
+            - "slip_system_id"
+            - "burgers_vector"
     """
-    print("\n--- Computing Gaussian Smearing for Dislocation Density ---")
+    print(f"\n--- Computing Density Maps with Theta Binning ({nthetaintervals} intervals) ---")
 
     sigma = std_dev_mult * b
     cutoff_radius = cutoff_mult * sigma
@@ -691,13 +746,16 @@ def compute_dislocation_density_maps(generated_loops, nodes_active, b,
     # Normalization factor: ensures the integral of density equals the line length
     norm_factor = 1.0 / (2 * np.pi * sigma ** 2)
 
+    # Define bin edges for 0 to 360 degrees
+    # We use degrees for easier debugging, but math works same for radians
+    bin_edges = np.linspace(0, 360, nthetaintervals + 1)
+
     # --- 1. Pre-build KDTrees for every active mesh ---
     mesh_acceleration_structures = {}
 
     print(f"Building search trees for {len(nodes_active)} active meshes...")
 
     for mesh_idx, mesh_data in enumerate(nodes_active):
-        # Force cast to standard python int to avoid numpy int32/int64 mismatches
         n_id = int(mesh_data['slip_plane_normal_id'])
         s_id = int(mesh_data['slip_plane_stack_id'])
 
@@ -726,7 +784,7 @@ def compute_dislocation_density_maps(generated_loops, nodes_active, b,
             'shape': X.shape
         }
 
-    # --- 2. Iterate over loops and compute density ---
+    # --- 2. Iterate over loops ---
     QQ = {}
     missing_mesh_count = 0
 
@@ -742,30 +800,63 @@ def compute_dislocation_density_maps(generated_loops, nodes_active, b,
         struct = mesh_acceleration_structures[(n_id, s_id)]
         tree = struct['tree']
         indices_map = struct['indices_map']
-        grid_shape = struct['shape']
+        grid_shape_2d = struct['shape']
 
-        # Initialize Density Map
-        density_map = np.zeros(grid_shape)
+        # Initialize 3D Density Map: (nx, ny, nthetaintervals)
+        # We add the 3rd dimension for theta bins
+        density_map_3d = np.zeros((grid_shape_2d[0], grid_shape_2d[1], nthetaintervals))
 
         points = loop['segments']
+        b_vec = loop['burgers_vector']
+
+        # Normalize Burgers vector
+        b_norm = np.linalg.norm(b_vec)
+        b_unit = b_vec / b_norm if b_norm > 0 else b_vec
 
         # Calculate segment vectors, lengths, and centers
-        # Vector from point i to i+1
         vecs = points[1:] - points[:-1]
         lengths = np.linalg.norm(vecs, axis=1)
         centers = (points[1:] + points[:-1]) / 2.0
 
-        # --- 3. Smear each segment ---
+        # --- 3. Process Segments ---
         for i, center in enumerate(centers):
             seg_len = lengths[i]
+            if seg_len == 0: continue
 
+            # --- A. Calculate Angle Theta ---
+            t_unit = vecs[i] / seg_len
+
+            # Dot product for angle: cos(theta) = t . b
+            dot_product = np.dot(t_unit, b_unit)
+            dot_product = np.clip(dot_product, -1.0, 1.0)
+            angle_rad = np.arccos(dot_product)
+            angle_deg = np.degrees(angle_rad)  # Result is 0 to 180
+
+            # Since dislocation character is usually 0 (screw) to 90 (edge),
+            # but mathematical angle is 0 to 180.
+            # If you specifically need 0-360 orientation (direction matters),
+            # we need a reference vector to determine sign.
+            # For standard character angle, 0-180 is usually sufficient.
+            # If you strictly need 0-2pi mapping, we assume the input request implies 0-360.
+            # However, arccos only gives 0-180.
+            # To get full 0-360, we'd need a plane normal cross product check.
+            # Assuming simple 0-180 mapping is acceptable or 0-360 is mapped:
+
+            # Map angle to bin index
+            # np.digitize returns 1 for first bin, so we subtract 1 to get 0-based index
+            bin_idx = np.digitize(angle_deg, bin_edges) - 1
+
+            # Handle edge case where angle is exactly 360 (goes to index nthetaintervals)
+            if bin_idx >= nthetaintervals:
+                bin_idx = nthetaintervals - 1
+
+            # --- B. Spatial Smearing ---
             # Find mesh nodes within cutoff radius
             neighbor_indices = tree.query_ball_point(center, cutoff_radius)
 
             if not neighbor_indices:
                 continue
 
-            # Get coordinates of these neighbors
             neighbor_coords = tree.data[neighbor_indices]
 
             # Calculate Gaussian weights
@@ -775,13 +866,14 @@ def compute_dislocation_density_maps(generated_loops, nodes_active, b,
             # Weight = Length * Gaussian_Value
             weights = (seg_len * norm_factor) * np.exp(-dist_sq / two_sigma_sq)
 
-            # Map back to 2D grid
+            # --- C. Add to specific Theta Bin ---
             for k, tree_idx in enumerate(neighbor_indices):
                 r, c = indices_map[tree_idx]
-                density_map[r, c] += weights[k]
+                # Add density ONLY to the layer corresponding to the angle bin
+                density_map_3d[r, c, bin_idx] += weights[k]
 
         QQ[loop_idx] = {
-            "density_map": density_map,
+            "density_map": density_map_3d,  # Now 3D
             "burgers_vector": loop['burgers_vector'],
             "normal_id": n_id,
             "stack_id": s_id,
@@ -790,7 +882,6 @@ def compute_dislocation_density_maps(generated_loops, nodes_active, b,
 
     if missing_mesh_count > 0:
         print(f"Warning: {missing_mesh_count} loops were skipped because their slip plane mesh was missing.")
-        print("Ensure 'generate_dislocation_loops_per_system' only picks stacks present in 'nodes_active'.")
 
-    print(f"Density mapping complete. Generated maps for {len(QQ)} loops.")
+    print(f"Computation complete. Generated 3D maps for {len(QQ)} loops.")
     return QQ
