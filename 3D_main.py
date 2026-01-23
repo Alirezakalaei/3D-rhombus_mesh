@@ -1,7 +1,7 @@
-# main.py
 
 import numpy as np
 import matplotlib
+
 matplotlib.use('TKAgg')
 
 import matplotlib.pyplot as plt
@@ -21,6 +21,8 @@ from fcc_lib import (
     smear_configurational_density
 
 )
+
+from threeD_stress import (get_elastic_constants,compute_interaction_stress_mura, get_epsilon_delta)
 
 # =============================================================================
 # SCRIPT FOR INTERACTIVE ANALYSIS
@@ -42,6 +44,12 @@ target_density= 10**11
 d = 500*b
 CRSS = .5*10**6
 app_load = 20*10**6
+mu = 46e9 #Pa
+nu = .34
+a= 1*b # singularity removal
+min_density_val = 1e5 #m^-2
+cutoff_dist_val = 2000*b
+
 load_direction= np.array([0, 0, 1])
 b_vecs = calculate_tetrahedron_slip_systems(b)
 box_edge_length = 20000 * b
@@ -187,3 +195,45 @@ if QQ_coarse:
     plt.legend()
     plt.show()
 
+##########################################################
+# stress computation section
+
+C_tensor = get_elastic_constants(mu, nu)
+eps_tensor, delta_tensor = get_epsilon_delta()
+# Compute stress
+interaction_stress_data = compute_interaction_stress_mura(
+    QQ_coarse,  # Source densities
+    C_tensor, eps_tensor, delta_tensor,
+    nodes_active,  # Target meshes
+    b_vecs,  # Slip system definitions
+    b,  # Burgers magnitude
+    mu,  # Mu
+    nu,  # Nu
+    a,  # 'a' parameter
+    cut_off_dist=cutoff_dist_val,
+    min_cut_off_density=min_density_val
+)
+
+# =============================================================================
+# VISUALIZATION CHECK
+# =============================================================================
+if interaction_stress_data:
+    # Example: Visualize stress for the first available system
+    first_key = list(interaction_stress_data.keys())[0]
+    data_entry = interaction_stress_data[first_key]
+
+    stress_map = data_entry['stress_field']
+    # Calculate magnitude for plotting
+    stress_mag = np.linalg.norm(stress_map, axis=2)
+
+    # Mask 0 values (where there is no mesh) for better visualization
+    stress_mag_masked = np.ma.masked_where(stress_mag == 0, stress_mag)
+
+    plt.figure(figsize=(10, 8))
+    plt.imshow(stress_mag_masked, origin='lower', cmap='plasma')
+    plt.title(
+        f"Interaction Stress Magnitude\nPlane {data_entry['slip_plane_normal_id']}, Stack {data_entry['slip_plane_stack_id']}, Sys {data_entry['slip_system_id']}")
+    plt.colorbar(label='Stress Interaction (Pa)')
+    plt.show()
+
+    print(f"Computed stress for {len(interaction_stress_data)} target systems.")

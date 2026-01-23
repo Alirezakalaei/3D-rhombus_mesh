@@ -711,7 +711,6 @@ def generate_dislocation_loops_per_system(active_s, node_on_slip_sys, nodes_acti
 #############################################
 
 
-# fcc_lib.py
 
 def compute_density_and_theta_maps(generated_loops, nodes_active, b,
                                    nthetaintervals, std_dev_mult=600, cutoff_mult=5):
@@ -886,8 +885,6 @@ def compute_density_and_theta_maps(generated_loops, nodes_active, b,
     print(f"Computation complete. Generated 3D maps for {len(QQ)} loops.")
     return QQ
 
-
-import numpy as np
 
 
 def smear_configurational_density(QQ_input, nthetaintervals, std_dev_rad=(5 * np.pi / 180)):
