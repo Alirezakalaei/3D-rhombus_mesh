@@ -61,7 +61,7 @@ nthetaintervals = 360  # Example: Divide 0-360 degrees into 18 bins (20 degrees 
 # =============================================================================
 print("\n--- 2. Generating Grid ---")
 # Generate the grid points and the mask for the simulation box
-XX, YY, ZZ, box_mask = generate_grid(b, d, box_edge_length)
+XX, YY, ZZ, box_mask, dv = generate_grid(b, d, box_edge_length)
 
 print("\n--- 4. Calculating Slip Plane IDs ---")
 # Assign a plane ID to every node for each of the four normal directions

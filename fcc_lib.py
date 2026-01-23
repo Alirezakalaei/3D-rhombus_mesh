@@ -40,7 +40,7 @@ def generate_grid(b, d, box_edge_length):
     # Scale the unit vectors by the Burgers vector 'b' (physical size)
     # and the grid spacing multiplier 'd'
     p1, p2, p3 = (d) * u1, (d) * u2, (d) * u3
-
+    dv = np.dot(p1, np.cross(p2,p3))
     # To find the range of indices (i, j, k) needed, we transform the
     # corners of the Cartesian box into the (p1, p2, p3) coordinate system.
     M = np.array([p1, p2, p3]).T
@@ -65,7 +65,7 @@ def generate_grid(b, d, box_edge_length):
     box_mask = (XX >= 0) & (XX < L) & (YY >= 0) & (YY < L) & (ZZ >= 0) & (ZZ < L)
 
     print(f"Grid generated. Total points inside box: {np.sum(box_mask)}")
-    return XX, YY, ZZ, box_mask
+    return XX, YY, ZZ, box_mask, dv
 
 def calculate_tetrahedron_slip_systems(b):
     """
