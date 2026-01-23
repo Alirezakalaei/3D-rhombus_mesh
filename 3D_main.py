@@ -129,7 +129,7 @@ for i in range(slip_plane_ids.shape[0]):
 
 rss, active_s =calculate_rss_and_activity(load_direction, app_load, CRSS, b_vecs)
 
-nodes_active= reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ)
+nodes_active= reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ, (box_edge_length,box_edge_length,box_edge_length))
 ##############################
 # now we will make the dislocation loops
 

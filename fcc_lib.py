@@ -527,17 +527,19 @@ def calculate_rss_and_activity(loading_dir, load_val, crss, slip_systems):
 
 
 
-
-
-
-def reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ):
+def reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ, box_size):
     """
-    Reconstructs specific slip plane instances based on active slip systems.
+    Reconstructs specific slip plane instances based on active slip systems,
+    filtering out nodes that fall outside the simulation box.
+
+    Stacks with fewer than 5 nodes are strictly excluded.
 
     Args:
         active_s: List or Matrix of active systems.
         node_on_slip_sys: Dictionary {(plane_type, stack_id): [indices]}.
-        XX, YY, ZZ: 3D coordinate arrays.
+        XX, YY, ZZ: 3D coordinate arrays of the original mesh.
+        box_size: Tuple or list (Lx, Ly, Lz) defining the simulation dimensions.
+                  Points must be within [0, Lx], [0, Ly], [0, Lz].
 
     Returns:
         List of dictionaries containing grid data and requested IDs.
@@ -547,7 +549,7 @@ def reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ):
     # Structure: { plane_type_id: {dir_id_1, dir_id_2}, ... }
     active_map = {}
 
-    # Handle numpy array input (common in previous steps)
+    # Handle numpy array input
     if isinstance(active_s, np.ndarray):
         rows, cols = active_s.shape
         for p_type in range(rows):
@@ -563,6 +565,9 @@ def reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ):
 
     reconstructed_nodes = []
 
+    # Ensure box_size is accessible as individual components
+    Lx, Ly, Lz = box_size
+
     # 2. Iterate through every specific plane instance found
     for (p_type, p_stack_id), indices_list in node_on_slip_sys.items():
 
@@ -571,21 +576,42 @@ def reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ):
 
             ids = np.array(indices_list)
 
-            # Pre-check: strictly less than 5 nodes are ignored
+            # --- CRITICAL CHECK: IGNORE STACKS WITH FEWER THAN 5 NODES ---
+            # If the stack has less than 5 raw nodes, we skip it entirely.
+            # It will not be added to reconstructed_nodes.
             if ids.shape[0] < 5:
                 continue
 
-            # Extract 3D coordinates
+            # Extract 3D coordinates from the raw grid
             u, v, w = ids[:, 0], ids[:, 1], ids[:, 2]
             points = np.column_stack((XX[u, v, w], YY[u, v, w], ZZ[u, v, w]))
 
             try:
-                # Generate Mesh using the specific algorithm
+                # Generate Mesh using the specific algorithm (assumed to be defined elsewhere)
                 x_grid, y_grid, z_grid, a_1, a_2 = structured_mesh_from_fcc_plane(points)
 
-                # If None, it means mesh construction failed (e.g. no valid basis found)
+                # If None, it means mesh construction failed
                 if x_grid is None:
                     continue
+
+                # --- BOX SIZE FILTERING ---
+                # Create a boolean mask where True indicates the point is OUTSIDE the box
+                # We assume the box starts at (0,0,0)
+                out_of_bounds_mask = (
+                        (x_grid < 0) | (x_grid > Lx) |
+                        (y_grid < 0) | (y_grid > Ly) |
+                        (z_grid < 0) | (z_grid > Lz)
+                )
+
+                # If the entire generated mesh is out of bounds, we skip adding it
+                if np.all(out_of_bounds_mask):
+                    continue
+
+                # Set out-of-bounds coordinates to NaN to preserve 2D structure
+                x_grid[out_of_bounds_mask] = np.nan
+                y_grid[out_of_bounds_mask] = np.nan
+                z_grid[out_of_bounds_mask] = np.nan
+                # --------------------------
 
                 # Construct the result dictionary with ALL requested IDs
                 plane_data = {
@@ -595,9 +621,9 @@ def reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ):
                     "a_1": a_1,
                     "a_2": a_2,
                     # Requested Output IDs:
-                    "slip_plane_normal_id": p_type,  # The Plane Type (0-3)
-                    "slip_plane_stack_id": p_stack_id,  # The Stack ID
-                    "active_slip_system_ids": list(active_map[p_type])  # List of active directions
+                    "slip_plane_normal_id": p_type,
+                    "slip_plane_stack_id": p_stack_id,
+                    "active_slip_system_ids": list(active_map[p_type])
                 }
 
                 reconstructed_nodes.append(plane_data)
