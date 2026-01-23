@@ -18,7 +18,8 @@ from fcc_lib import (
     reconstruct_active_slip_planes,
     generate_dislocation_loops_per_system,
     compute_density_and_theta_maps,
-    smear_configurational_density
+    smear_configurational_density,
+    normalize_density_to_target
 
 )
 
@@ -48,7 +49,7 @@ mu = 46e9 #Pa
 nu = .34
 a= 1*b # singularity removal
 min_density_val = 1e5 #m^-2
-cutoff_dist_val = 2000*b
+cutoff_dist_val = 4000*b
 
 load_direction= np.array([0, 0, 1])
 b_vecs = calculate_tetrahedron_slip_systems(b)
@@ -171,7 +172,7 @@ std_dev_theta = 5 * np.pi / 180
 
 # Call the new function
 QQ_coarse = smear_configurational_density(QQ, nthetaintervals, std_dev_rad=std_dev_theta)
-
+QQ_coarse = normalize_density_to_target(QQ_coarse, nodes_active, target_density)
 # =============================================================================
 # VISUALIZATION CHECK
 # =============================================================================
@@ -219,12 +220,12 @@ interaction_stress_data = compute_interaction_stress_mura(
 # =============================================================================
 if interaction_stress_data:
     # Example: Visualize stress for the first available system
-    first_key = list(interaction_stress_data.keys())[0]
+    first_key = list(interaction_stress_data.keys())[3]
     data_entry = interaction_stress_data[first_key]
 
     stress_map = data_entry['stress_field']
     # Calculate magnitude for plotting
-    stress_mag = np.linalg.norm(stress_map, axis=2)
+    stress_mag = stress_map
 
     # Mask 0 values (where there is no mesh) for better visualization
     stress_mag_masked = np.ma.masked_where(stress_mag == 0, stress_mag)

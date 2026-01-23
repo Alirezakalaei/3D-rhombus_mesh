@@ -634,22 +634,109 @@ def reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ, box_s
     return reconstructed_nodes
 
 
+import numpy as np
+import random
+from scipy.spatial import cKDTree
+
+
+def reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ, box_size):
+    """
+    Reconstructs specific slip plane instances based on active slip systems,
+    filtering out nodes that fall outside the simulation box.
+    """
+    # 1. Parse Active Systems into a Map
+    active_map = {}
+    if isinstance(active_s, np.ndarray):
+        rows, cols = active_s.shape
+        for p_type in range(rows):
+            for d_id in range(cols):
+                if active_s[p_type, d_id] == 1:
+                    active_map.setdefault(p_type, set()).add(d_id)
+    else:
+        for sys in active_s:
+            p_type = int(sys[0])
+            d_id = int(sys[1])
+            active_map.setdefault(p_type, set()).add(d_id)
+
+    reconstructed_nodes = []
+    Lx, Ly, Lz = box_size
+
+    for (p_type, p_stack_id), indices_list in node_on_slip_sys.items():
+        if p_type in active_map:
+            ids = np.array(indices_list)
+
+            # Check for minimum nodes
+            if ids.shape[0] < 5:
+                continue
+
+            u, v, w = ids[:, 0], ids[:, 1], ids[:, 2]
+            points = np.column_stack((XX[u, v, w], YY[u, v, w], ZZ[u, v, w]))
+
+            try:
+                x_grid, y_grid, z_grid, a_1, a_2 = structured_mesh_from_fcc_plane(points)
+
+                if x_grid is None: continue
+
+                # Box Filtering
+                out_of_bounds_mask = (
+                        (x_grid < 0) | (x_grid > Lx) |
+                        (y_grid < 0) | (y_grid > Ly) |
+                        (z_grid < 0) | (z_grid > Lz)
+                )
+
+                if np.all(out_of_bounds_mask): continue
+
+                x_grid[out_of_bounds_mask] = np.nan
+                y_grid[out_of_bounds_mask] = np.nan
+                z_grid[out_of_bounds_mask] = np.nan
+
+                plane_data = {
+                    "x_grid": x_grid,
+                    "y_grid": y_grid,
+                    "z_grid": z_grid,
+                    "a_1": a_1,
+                    "a_2": a_2,
+                    "slip_plane_normal_id": p_type,
+                    "slip_plane_stack_id": p_stack_id,
+                    "active_slip_system_ids": list(active_map[p_type])
+                }
+                reconstructed_nodes.append(plane_data)
+
+            except Exception as e:
+                print(f"Skipping plane ({p_type}, {p_stack_id}) due to error: {e}")
+
+    return reconstructed_nodes
 
 
 def generate_dislocation_loops_per_system(active_s, node_on_slip_sys, nodes_active, XX, YY, ZZ, b_vecs,
                                           target_density, min_size_m, max_size_m, b, box_length_m):
     """
     Generates loops ONLY on slip planes that have successfully generated meshes.
+    Selects centers randomly from VALID (non-NaN) mesh points.
     """
     generated_loops = []
 
-    # 1. Identify Valid Stacks from nodes_active
-    # We create a set of (normal_id, stack_id) that actually have meshes.
-    valid_stacks_set = set()
+    # 1. Build a lookup for valid points in each active mesh
+    # Map: (normal_id, stack_id) -> List of [x, y, z] coordinates that are valid
+    valid_mesh_points = {}
+
     for node in nodes_active:
         n_id = int(node['slip_plane_normal_id'])
         s_id = int(node['slip_plane_stack_id'])
-        valid_stacks_set.add((n_id, s_id))
+
+        X = node['x_grid']
+        Y = node['y_grid']
+        Z = node['z_grid']
+
+        # Find indices where X is not NaN (valid points inside box)
+        valid_indices = np.argwhere(~np.isnan(X))
+
+        if len(valid_indices) > 0:
+            # Extract coordinates
+            rows = valid_indices[:, 0]
+            cols = valid_indices[:, 1]
+            coords = np.column_stack((X[rows, cols], Y[rows, cols], Z[rows, cols]))
+            valid_mesh_points[(n_id, s_id)] = coords
 
     real_volume_m3 = box_length_m ** 3
     target_length_per_system_m = target_density * real_volume_m3
@@ -661,20 +748,17 @@ def generate_dislocation_loops_per_system(active_s, node_on_slip_sys, nodes_acti
         for d_idx in range(3):
             if active_s[n_idx, d_idx] == 1:
 
-                # Get all potential stacks for this normal
-                potential_stacks = []
-                # Check keys in node_on_slip_sys matching this normal
-                for (k_n, k_s) in node_on_slip_sys.keys():
+                # Get potential stacks that actually exist in our valid mesh list
+                available_stacks = [s for s in range(1000) if
+                                    (n_idx, s) in valid_mesh_points]  # Assuming max 1000 stacks, or iterate keys
+
+                # Better way to get available stacks for this normal
+                available_stacks = []
+                for (k_n, k_s) in valid_mesh_points.keys():
                     if k_n == n_idx:
-                        potential_stacks.append(k_s)
-
-                potential_stacks = list(set(potential_stacks))
-
-                # FILTER: Only keep stacks that exist in valid_stacks_set
-                available_stacks = [s for s in potential_stacks if (n_idx, s) in valid_stacks_set]
+                        available_stacks.append(k_s)
 
                 if not available_stacks:
-                    print(f"  > System ({n_idx}, {d_idx}) Active, but no valid meshes found. Skipping.")
                     continue
 
                 current_system_length_m = 0.0
@@ -685,13 +769,16 @@ def generate_dislocation_loops_per_system(active_s, node_on_slip_sys, nodes_acti
                 # 3. Generate Loops
                 while current_system_length_m < target_length_per_system_m:
                     stack_id = random.choice(available_stacks)
-                    indices = node_on_slip_sys.get((n_idx, stack_id))
 
-                    rand_pt_idx = random.choice(indices)
-                    i, j, k = rand_pt_idx
-                    center_point = np.array([XX[i, j, k], YY[i, j, k], ZZ[i, j, k]])
+                    # CORRECTION: Pick center from valid mesh points, not raw grid indices
+                    valid_coords = valid_mesh_points[(n_idx, stack_id)]
+                    if len(valid_coords) == 0: continue
 
-                    # Local coords
+                    # Randomly select one coordinate row
+                    rand_idx = random.randint(0, len(valid_coords) - 1)
+                    center_point = valid_coords[rand_idx]
+
+                    # Local coords setup
                     if np.abs(normal_vec[2]) < 0.9:
                         helper = np.array([0, 0, 1])
                     else:
@@ -734,53 +821,33 @@ def generate_dislocation_loops_per_system(active_s, node_on_slip_sys, nodes_acti
 
     return generated_loops
 
-#############################################
-
-
 
 def compute_density_and_theta_maps(generated_loops, nodes_active, b,
                                    nthetaintervals, std_dev_mult=600, cutoff_mult=5):
     """
     Computes a combined Dislocation Density and Theta map.
 
-    Instead of a simple 2D density map, this function produces a 3D array where the
-    density is binned by the orientation angle (theta) of the dislocation line relative
-    to its Burgers vector.
-
-    Args:
-        generated_loops: List of loop data dictionaries.
-        nodes_active: List of mesh data dictionaries.
-        b: Burgers vector magnitude.
-        nthetaintervals (int): Number of intervals to divide the 0-2pi (0-360 deg) range.
-        std_dev_mult: Multiplier for Gaussian sigma.
-        cutoff_mult: Multiplier for cutoff radius.
-
-    Returns:
-        QQ (dict): Dictionary keyed by loop index containing:
-            - "density_map": nd.array of shape (nx, ny, nthetaintervals)
-            - "normal_id"
-            - "stack_id"
-            - "slip_system_id"
-            - "burgers_vector"
+    UPDATES:
+    1. Theta is calculated as 0-360 degrees using arctan2 and the plane normal.
+    2. Standard Gaussian spreading is used (no discrete normalization to 1).
     """
     print(f"\n--- Computing Density Maps with Theta Binning ({nthetaintervals} intervals) ---")
 
     sigma = std_dev_mult * b
     cutoff_radius = cutoff_mult * sigma
     two_sigma_sq = 2 * sigma ** 2
-    # Normalization factor: ensures the integral of density equals the line length
+    # Standard Gaussian normalization factor for 2D spreading
+    # Integral of (norm_factor * exp(-r^2/2sigma^2)) over 2D space = 1
     norm_factor = 1.0 / (2 * np.pi * sigma ** 2)
 
-    # Define bin edges for 0 to 360 degrees
-    # We use degrees for easier debugging, but math works same for radians
     bin_edges = np.linspace(0, 360, nthetaintervals + 1)
 
-    # --- 1. Pre-build KDTrees for every active mesh ---
+    # --- 1. Pre-build KDTrees ---
     mesh_acceleration_structures = {}
 
     print(f"Building search trees for {len(nodes_active)} active meshes...")
 
-    for mesh_idx, mesh_data in enumerate(nodes_active):
+    for mesh_data in nodes_active:
         n_id = int(mesh_data['slip_plane_normal_id'])
         s_id = int(mesh_data['slip_plane_stack_id'])
 
@@ -788,25 +855,26 @@ def compute_density_and_theta_maps(generated_loops, nodes_active, b,
         Y = mesh_data['y_grid']
         Z = mesh_data['z_grid']
 
-        # Only build tree on valid points (not NaNs)
+        # We need the plane normal to determine the sign of the angle (0-360)
+        a1 = mesh_data['a_1']
+        a2 = mesh_data['a_2']
+        plane_normal = np.cross(a1, a2)
+        plane_normal /= np.linalg.norm(plane_normal)
+
         valid_mask = ~np.isnan(X)
-        valid_indices = np.argwhere(valid_mask)  # (row, col) indices
+        valid_indices = np.argwhere(valid_mask)
 
-        valid_coords = np.column_stack((
-            X[valid_mask],
-            Y[valid_mask],
-            Z[valid_mask]
-        ))
+        valid_coords = np.column_stack((X[valid_mask], Y[valid_mask], Z[valid_mask]))
 
-        if len(valid_coords) == 0:
-            continue
+        if len(valid_coords) == 0: continue
 
         tree = cKDTree(valid_coords)
 
         mesh_acceleration_structures[(n_id, s_id)] = {
             'tree': tree,
             'indices_map': valid_indices,
-            'shape': X.shape
+            'shape': X.shape,
+            'plane_normal': plane_normal
         }
 
     # --- 2. Iterate over loops ---
@@ -817,7 +885,6 @@ def compute_density_and_theta_maps(generated_loops, nodes_active, b,
         n_id = int(loop['normal_id'])
         s_id = int(loop['stack_id'])
 
-        # Check if we have a mesh for this loop's plane
         if (n_id, s_id) not in mesh_acceleration_structures:
             missing_mesh_count += 1
             continue
@@ -826,19 +893,16 @@ def compute_density_and_theta_maps(generated_loops, nodes_active, b,
         tree = struct['tree']
         indices_map = struct['indices_map']
         grid_shape_2d = struct['shape']
+        n_vec = struct['plane_normal']
 
-        # Initialize 3D Density Map: (nx, ny, nthetaintervals)
-        # We add the 3rd dimension for theta bins
         density_map_3d = np.zeros((grid_shape_2d[0], grid_shape_2d[1], nthetaintervals))
 
         points = loop['segments']
         b_vec = loop['burgers_vector']
 
-        # Normalize Burgers vector
         b_norm = np.linalg.norm(b_vec)
         b_unit = b_vec / b_norm if b_norm > 0 else b_vec
 
-        # Calculate segment vectors, lengths, and centers
         vecs = points[1:] - points[:-1]
         lengths = np.linalg.norm(vecs, axis=1)
         centers = (points[1:] + points[:-1]) / 2.0
@@ -848,35 +912,30 @@ def compute_density_and_theta_maps(generated_loops, nodes_active, b,
             seg_len = lengths[i]
             if seg_len == 0: continue
 
-            # --- A. Calculate Angle Theta ---
+            # --- A. Calculate Angle Theta (0 to 360) ---
             t_unit = vecs[i] / seg_len
 
-            # Dot product for angle: cos(theta) = t . b
-            dot_product = np.dot(t_unit, b_unit)
-            dot_product = np.clip(dot_product, -1.0, 1.0)
-            angle_rad = np.arccos(dot_product)
-            angle_deg = np.degrees(angle_rad)  # Result is 0 to 180
+            # 1. Cosine component: b . t
+            cos_theta = np.dot(b_unit, t_unit)
 
-            # Since dislocation character is usually 0 (screw) to 90 (edge),
-            # but mathematical angle is 0 to 180.
-            # If you specifically need 0-360 orientation (direction matters),
-            # we need a reference vector to determine sign.
-            # For standard character angle, 0-180 is usually sufficient.
-            # If you strictly need 0-2pi mapping, we assume the input request implies 0-360.
-            # However, arccos only gives 0-180.
-            # To get full 0-360, we'd need a plane normal cross product check.
-            # Assuming simple 0-180 mapping is acceptable or 0-360 is mapped:
+            # 2. Sine component: (b x t) . n
+            # This determines the sign of the angle relative to the plane normal
+            cross_prod = np.cross(b_unit, t_unit)
+            sin_theta = np.dot(cross_prod, n_vec)
 
-            # Map angle to bin index
-            # np.digitize returns 1 for first bin, so we subtract 1 to get 0-based index
-            bin_idx = np.digitize(angle_deg, bin_edges) - 1
+            # 3. Full angle using arctan2(y, x) -> returns [-pi, pi]
+            angle_rad = np.arctan2(sin_theta, cos_theta)
 
-            # Handle edge case where angle is exactly 360 (goes to index nthetaintervals)
-            if bin_idx >= nthetaintervals:
-                bin_idx = nthetaintervals - 1
+            # 4. Convert to degrees [0, 360]
+            angle_deg = np.degrees(angle_rad)
+            if angle_deg < 0:
+                angle_deg += 360.0
 
-            # --- B. Spatial Smearing ---
-            # Find mesh nodes within cutoff radius
+            # Map to bin
+            bin_idx = int(angle_deg / (360.0 / nthetaintervals))
+            if bin_idx >= nthetaintervals: bin_idx = nthetaintervals - 1
+
+            # --- B. Spatial Smearing (Standard Gaussian) ---
             neighbor_indices = tree.query_ball_point(center, cutoff_radius)
 
             if not neighbor_indices:
@@ -884,21 +943,20 @@ def compute_density_and_theta_maps(generated_loops, nodes_active, b,
 
             neighbor_coords = tree.data[neighbor_indices]
 
-            # Calculate Gaussian weights
             diff = neighbor_coords - center
             dist_sq = np.sum(diff ** 2, axis=1)
 
-            # Weight = Length * Gaussian_Value
+            # Standard Gaussian Weighting
+            # This spreads the 'seg_len' over the area.
             weights = (seg_len * norm_factor) * np.exp(-dist_sq / two_sigma_sq)
 
             # --- C. Add to specific Theta Bin ---
             for k, tree_idx in enumerate(neighbor_indices):
                 r, c = indices_map[tree_idx]
-                # Add density ONLY to the layer corresponding to the angle bin
                 density_map_3d[r, c, bin_idx] += weights[k]
 
         QQ[loop_idx] = {
-            "density_map": density_map_3d,  # Now 3D
+            "density_map": density_map_3d,
             "burgers_vector": loop['burgers_vector'],
             "normal_id": n_id,
             "stack_id": s_id,
@@ -906,11 +964,10 @@ def compute_density_and_theta_maps(generated_loops, nodes_active, b,
         }
 
     if missing_mesh_count > 0:
-        print(f"Warning: {missing_mesh_count} loops were skipped because their slip plane mesh was missing.")
+        print(f"Warning: {missing_mesh_count} loops skipped (missing mesh).")
 
     print(f"Computation complete. Generated 3D maps for {len(QQ)} loops.")
     return QQ
-
 
 
 def smear_configurational_density(QQ_input, nthetaintervals, std_dev_rad=(5 * np.pi / 180)):
@@ -999,3 +1056,90 @@ def smear_configurational_density(QQ_input, nthetaintervals, std_dev_rad=(5 * np
 
     print("Smearing complete.")
     return QQ_smeared
+
+###############################################
+def normalize_density_to_target(QQ, nodes_active, target_density):
+    """
+    Normalizes the density maps in QQ so that the average density per slip system
+    matches the target_density.
+
+    Logic:
+    1. Sum total density values for all loops belonging to a specific slip system.
+    2. Count total valid nodes (grid points) for all stacks belonging to that slip system.
+    3. Average Density = Total Sum / Total Nodes.
+    4. Scaling Factor = Target Density / Average Density.
+    5. Multiply QQ maps by this factor.
+
+    Args:
+        QQ: Dictionary of loop data containing 'density_map', 'normal_id', 'slip_system_id'.
+        nodes_active: List of mesh dictionaries containing 'x_grid' and 'active_slip_system_ids'.
+        target_density: Float, desired density value.
+
+    Returns:
+        QQ_normalized: The modified dictionary with scaled density maps.
+    """
+    print(f"\n--- Normalizing Density to Target: {target_density:.2e} ---")
+
+    # Data structures to aggregate sums
+    # Keys: (normal_id, slip_system_id)
+    total_density_val = {}
+    total_nodes_count = {}
+
+    # 1. Count Total Nodes per Slip System
+    # A single stack (plane) might support multiple slip systems (e.g. 3 directions).
+    # We add the stack's node count to the denominator of *each* system it supports.
+    for mesh in nodes_active:
+        n_id = int(mesh['slip_plane_normal_id'])
+
+        # Count valid (non-NaN) nodes in this stack
+        valid_nodes = np.sum(~np.isnan(mesh['x_grid']))
+
+        # Add this count to every slip system active on this plane
+        active_systems = mesh['active_slip_system_ids']  # Expected to be a list, e.g. [0, 1, 2]
+
+        for sys_id in active_systems:
+            key = (n_id, int(sys_id))
+            total_nodes_count[key] = total_nodes_count.get(key, 0) + valid_nodes
+
+    # 2. Sum Total Density currently in QQ per Slip System
+    for loop_key, loop_data in QQ.items():
+        n_id = int(loop_data['normal_id'])
+        sys_id = int(loop_data['slip_system_id'])
+        key = (n_id, sys_id)
+
+        # Sum all density in the 3D map
+        current_sum = np.sum(loop_data['density_map'])
+        total_density_val[key] = total_density_val.get(key, 0.0) + current_sum
+
+    # 3. Calculate Scaling Factors
+    scaling_factors = {}
+
+    for key in total_nodes_count:
+        n_nodes = total_nodes_count[key]
+        curr_dens_sum = total_density_val.get(key, 0.0)
+
+        if n_nodes > 0 and curr_dens_sum > 0:
+            avg_val = curr_dens_sum / n_nodes
+            factor = target_density / avg_val
+            scaling_factors[key] = factor
+            print(
+                f"  > System {key}: Nodes={n_nodes}, RawSum={curr_dens_sum:.2e}, Avg={avg_val:.2e}, Factor={factor:.2f}")
+        else:
+            scaling_factors[key] = 1.0
+            print(f"  > System {key}: Insufficient data to normalize (Factor=1.0)")
+
+    # 4. Apply Scaling Factors to QQ
+    QQ_normalized = QQ.copy()  # Shallow copy is fine if we modify arrays in place or replace them
+
+    for loop_key, loop_data in QQ_normalized.items():
+        n_id = int(loop_data['normal_id'])
+        sys_id = int(loop_data['slip_system_id'])
+        key = (n_id, sys_id)
+
+        factor = scaling_factors.get(key, 1.0)
+
+        # Multiply the map
+        loop_data['density_map'] *= factor
+
+    print("Normalization complete.")
+    return QQ_normalized

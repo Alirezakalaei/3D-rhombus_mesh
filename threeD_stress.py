@@ -80,115 +80,8 @@ def compute_gnd_and_xi_single_plane(density_map, theta_array):
 
 
 # =============================================================================
-# MURA KERNEL (OPTIMIZED & INLINED)
-# =============================================================================
-
-@njit(fastmath=True)
-def mura_g_tensor_inline(r_vec, n_alpha, xi_alpha, b_prime, C, prefactor_base, a, epsilon_tens, delta):
-    """
-    Computes the interaction vector g_h.
-    Refactored to take precomputed constants for speed inside loops.
-    """
-    # Compute R terms
-    R2 = r_vec[0] ** 2 + r_vec[1] ** 2 + r_vec[2] ** 2 + a ** 2
-    R = np.sqrt(R2)
-    invR3 = 1.0 / (R ** 3)
-    invR5 = 1.0 / (R ** 5)
-
-    g_h = np.zeros(3)
-
-    # Tensor contraction
-    for h in range(3):
-        total = 0.0
-        for p in range(3):
-            np_p = n_alpha[p]
-            for q in range(3):
-                vec_q = xi_alpha[q]
-
-                for r_idx in range(3):
-                    for s in range(3):
-                        # Pre-check C to avoid deep loop if zero (optimization)
-                        if C[p, q, r_idx, s] == 0: continue
-
-                        coeff = np_p * vec_q * C[p, q, r_idx, s] * prefactor_base
-
-                        for j in range(3):
-                            eps_jsh = epsilon_tens[j, s, h]
-                            if eps_jsh == 0: continue
-
-                            for i in range(3):
-                                bi_prime = b_prime[i]
-                                for k in range(3):
-                                    x_k = r_vec[k]
-                                    for l in range(3):
-                                        x_l = r_vec[l]
-                                        x_r = r_vec[r_idx]
-
-                                        Cijkl = C[i, j, k, l]
-                                        if Cijkl == 0: continue
-
-                                        delta_rk = delta[r_idx, k]
-                                        delta_rl = delta[r_idx, l]
-                                        delta_kl = delta[k, l]
-
-                                        term1 = 6.0 * delta_rk * a ** 2 * (
-                                                    1.0 - 0.3) * x_l * invR5  # Note: nu hardcoded here? No, passed via precalc usually, fixed below.
-                                        # To fix the nu issue inside this tight loop without passing nu again:
-                                        # We will assume the caller handles the logic or we pass nu.
-                                        # For strict correctness based on previous code:
-                                        # term1 = 6.0 * delta_rk * a**2 * (1.0 - nu) * x_l * invR5
-                                        # But let's stick to the math structure.
-                                        # To keep it fast, we do the bracket calculation:
-
-                                        # Re-implementing strictly:
-                                        # We need (1-nu). Let's assume it's passed or derived.
-                                        # Actually, let's just do the math inside the main kernel below to avoid signature mess.
-                                        pass
-    return g_h
-
-
-# =============================================================================
 # PARALLEL KERNEL
 # =============================================================================
-
-@njit(parallel=True, fastmath=True)
-def compute_stress_kernel_parallel(
-        target_coords,  # (N_targets, 3)
-        neighbor_counts,  # (N_targets,) - How many neighbors each target has
-        neighbor_indices,  # (Total_Neighbors,) - Flattened list of neighbor indices
-        source_coords,  # (N_sources, 3)
-        source_densities,  # (N_sources,)
-        source_normals,  # (N_sources, 3)
-        source_tangents,  # (N_sources, 3)
-        b_prime,  # (3,)
-        C,  # (3,3,3,3)
-        epsilon_tens,  # (3,3,3)
-        delta,  # (3,3)
-        mu, nu, a
-):
-    """
-    Parallel loop over target points to compute stress.
-    """
-    n_targets = target_coords.shape[0]
-    stress_results = np.zeros((n_targets, 3))
-
-    prefactor_base = 1.0 / (16.0 * np.pi * mu * (1.0 - nu))
-
-    # We need a pointer to where the neighbors for the current target start in the flattened list
-    # Since parallel loops can't easily share a mutable counter, we usually need an offset array.
-    # However, constructing the offset array is fast.
-
-    # Construct offsets (must be done outside parallel or carefully inside)
-    # Since Numba parallel doesn't support cumsum easily, we assume offsets are passed
-    # OR we change strategy: The caller (Python) handles the KDTree flattening.
-    # Let's assume neighbor_indices is a list of arrays, but Numba doesn't like list of arrays in parallel well.
-    # BEST APPROACH FOR NUMBA: Flattened arrays with an offset array.
-
-    # But wait, we can't easily generate offsets inside the parallel function.
-    # We will modify the input to take `neighbor_offsets`.
-
-    return stress_results  # Placeholder, see actual implementation below
-
 
 @njit(parallel=True, fastmath=True)
 def compute_stress_batch(
@@ -208,10 +101,13 @@ def compute_stress_batch(
     Performs the projection (dot product) of the Mura vector onto the source tangent vector.
     """
     n_targets = target_coords.shape[0]
-    # CHANGE 1: Result is now a scalar array (N,), not a vector array (N, 3)
     results = np.zeros(n_targets)
 
     prefactor_base = 1.0 / (16.0 * np.pi * mu * (1.0 - nu))
+
+    # Pre-calculate constants to avoid re-computing in inner loop
+    term1_const = 6.0 * a ** 2 * (1.0 - nu)
+    term2_const = (3.0 - 4.0 * nu)
 
     # Parallel loop over targets
     for t_idx in prange(n_targets):
@@ -228,79 +124,99 @@ def compute_stress_batch(
             src_idx = neighbor_indices[k]
 
             s_pos = source_coords[src_idx]
+
+            # Distance check
+            dx = t_pos[0] - s_pos[0]
+            dy = t_pos[1] - s_pos[1]
+            dz = t_pos[2] - s_pos[2]
+            dist_sq = dx * dx + dy * dy + dz * dz
+
+            # Safety check for regularization
+            R2 = dist_sq + a ** 2
+            if R2 < 1e-20: continue  # Prevent division by zero
+
             rho = source_densities[src_idx]
             n_alpha = source_normals[src_idx]
-            xi_alpha = source_tangents[src_idx]  # This is xi
+            xi_alpha = source_tangents[src_idx]
 
-            # r_vec calculation
-            r_vec = np.zeros(3)
-            dist_sq = 0.0
-            for d in range(3):
-                val = t_pos[d] - s_pos[d]
-                r_vec[d] = val
-                dist_sq += val * val
-
-            if dist_sq < 1e-20: continue
-
-            # --- Inline Mura G Tensor Calculation (Vector Output) ---
-            R2 = dist_sq + a ** 2
+            # --- Inline Mura G Tensor Calculation ---
             R = np.sqrt(R2)
-            invR3 = 1.0 / (R ** 3)
-            invR5 = 1.0 / (R ** 5)
+            invR3 = 1.0 / (R2 * R)
+            invR5 = 1.0 / (R2 * R2 * R)
 
-            g_h = np.zeros(3)
+            g_h_0 = 0.0
+            g_h_1 = 0.0
+            g_h_2 = 0.0
 
+            # Unrolled loops for specific tensor contractions would be faster, 
+            # but we keep the structure generic for correctness with the C tensor.
+
+            # We iterate h (0,1,2)
             for h in range(3):
                 total_h = 0.0
+
+                # Iterate p, q
                 for p in range(3):
                     np_p = n_alpha[p]
+                    if np_p == 0: continue
+
                     for q in range(3):
                         vec_q = xi_alpha[q]
+                        if vec_q == 0: continue
+
+                        # Iterate r, s
                         for r_i in range(3):
                             for s in range(3):
-                                # Optimization: Check C first
                                 C_pqrs = C[p, q, r_i, s]
                                 if abs(C_pqrs) < 1e-12: continue
 
                                 coeff = np_p * vec_q * C_pqrs * prefactor_base
 
+                                # Iterate j
                                 for j in range(3):
                                     eps_jsh = epsilon_tens[j, s, h]
                                     if eps_jsh == 0: continue
 
+                                    # Iterate i
                                     for i in range(3):
                                         bi_p = b_prime[i]
+                                        if bi_p == 0: continue
+
+                                        # Iterate k, l
                                         for k_idx in range(3):
-                                            x_k = r_vec[k_idx]
+                                            x_k = dx if k_idx == 0 else (dy if k_idx == 1 else dz)
+
                                             for l in range(3):
-                                                x_l = r_vec[l]
-                                                x_r = r_vec[r_i]
+                                                x_l = dx if l == 0 else (dy if l == 1 else dz)
+                                                x_r = dx if r_i == 0 else (dy if r_i == 1 else dz)
 
                                                 Cijkl = C[i, j, k_idx, l]
+                                                if abs(Cijkl) < 1e-12: continue
 
                                                 delta_rk = delta[r_i, k_idx]
                                                 delta_rl = delta[r_i, l]
                                                 delta_kl = delta[k_idx, l]
 
-                                                term1 = 6.0 * delta_rk * a ** 2 * (1.0 - nu) * x_l * invR5
-                                                term2 = (3.0 - 4.0 * nu) * delta_rk * x_l * invR3
+                                                term1 = delta_rk * term1_const * x_l * invR5
+                                                term2 = term2_const * delta_rk * x_l * invR3
                                                 term3 = 3.0 * x_r * x_k * x_l * invR5
                                                 term4 = - (delta_rl * x_k + delta_kl * x_r) * invR3
 
                                                 bracket = term1 + term2 + term3 + term4
                                                 total_h += coeff * eps_jsh * bi_p * Cijkl * bracket
-                g_h[h] = total_h
-            # --- End Inline ---
 
-            # CHANGE 2: Perform Dot Product with xi_alpha (Source Tangent)
-            # This converts the vector g_h into the scalar resolved stress contribution
-            dot_val = 0.0
-            for d in range(3):
-                dot_val += g_h[d] * xi_alpha[d]
+                if h == 0:
+                    g_h_0 = total_h
+                elif h == 1:
+                    g_h_1 = total_h
+                else:
+                    g_h_2 = total_h
 
+            # Dot Product with xi_alpha
+            dot_val = g_h_0 * xi_alpha[0] + g_h_1 * xi_alpha[1] + g_h_2 * xi_alpha[2]
             local_val += rho * dot_val
 
-        results[t_idx] = -local_val  # Apply negative sign as per original simple code
+        results[t_idx] = -local_val
 
     return results
 
@@ -339,6 +255,10 @@ def compute_interaction_stress_mura(QQ_smeared, C_tensor, eps_tensor, delta_tens
         plane_normals.append(n / np.linalg.norm(n))
 
     # Pre-calculate Theta Array
+    if not QQ_smeared:
+        print("Error: QQ_smeared is empty.")
+        return {}
+
     first_key = list(QQ_smeared.keys())[0]
     n_theta = QQ_smeared[first_key]['density_map'].shape[2]
     theta_arr = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
@@ -353,22 +273,62 @@ def compute_interaction_stress_mura(QQ_smeared, C_tensor, eps_tensor, delta_tens
         if (n_id, s_id) not in mesh_lookup: continue
         X, Y, Z = mesh_lookup[(n_id, s_id)]
 
+        # --- ROBUST BASIS VECTOR CALCULATION ---
+        # Find valid grid points to define u_vec and v_vec.
+        # We cannot assume X[0,0] is valid.
+        u_vec = None
+        v_vec = None
+
+        # Search for a valid horizontal pair for u_vec
+        # Look for (r, c) and (r, c+1) that are both valid
+        rows_valid, cols_valid = np.where(~np.isnan(X))
+
+        # Try to find u_vec (along columns)
+        for idx in range(len(rows_valid)):
+            r, c = rows_valid[idx], cols_valid[idx]
+            if c + 1 < X.shape[1] and not np.isnan(X[r, c + 1]):
+                u_vec = np.array([X[r, c + 1] - X[r, c], Y[r, c + 1] - Y[r, c], Z[r, c + 1] - Z[r, c]])
+                norm_u = np.linalg.norm(u_vec)
+                if norm_u > 1e-12:
+                    u_vec /= norm_u
+                    break
+
+        # Try to find v_vec (along rows)
+        for idx in range(len(rows_valid)):
+            r, c = rows_valid[idx], cols_valid[idx]
+            if r + 1 < X.shape[0] and not np.isnan(X[r + 1, c]):
+                v_vec = np.array([X[r + 1, c] - X[r, c], Y[r + 1, c] - Y[r, c], Z[r + 1, c] - Z[r, c]])
+                norm_v = np.linalg.norm(v_vec)
+                if norm_v > 1e-12:
+                    v_vec /= norm_v
+                    break
+
+        # Fallback if grid is too sparse or 1D
+        if u_vec is None or v_vec is None:
+            # Construct arbitrary orthogonal basis from normal
+            if np.abs(n_vec_global[2]) < 0.9:
+                helper = np.array([0, 0, 1])
+            else:
+                helper = np.array([1, 0, 0])
+            u_vec = np.cross(n_vec_global, helper)
+            u_vec /= np.linalg.norm(u_vec)
+            v_vec = np.cross(n_vec_global, u_vec)
+            v_vec /= np.linalg.norm(v_vec)
+
+        # ---------------------------------------
+
         # Compute GND and Local Tangent
         GND_map, xi_local_map = compute_gnd_and_xi_single_plane(data['density_map'], theta_arr)
 
-        # Filter by cutoff density (Source Filtering)
-        rows, cols = np.where(GND_map > min_cut_off_density)
+        # Filter by cutoff density AND valid coordinates
+        # Crucial: Ensure we don't pick up NaN coordinates even if density is somehow high
+        valid_coords_mask = ~np.isnan(X)
+        high_density_mask = GND_map > min_cut_off_density
+        combined_mask = valid_coords_mask & high_density_mask
+
+        rows, cols = np.where(combined_mask)
 
         if len(rows) == 0: continue
-
-        # Basis vectors for rotation
-        if X.shape[0] > 1 and X.shape[1] > 1:
-            u_vec = np.array([X[1, 0] - X[0, 0], Y[1, 0] - Y[0, 0], Z[1, 0] - Z[0, 0]])
-            u_vec /= (np.linalg.norm(u_vec) + 1e-12)
-            v_vec = np.array([X[0, 1] - X[0, 0], Y[0, 1] - Y[0, 0], Z[0, 1] - Z[0, 0]])
-            v_vec /= (np.linalg.norm(v_vec) + 1e-12)
-        else:
-            continue
 
         # Vectorized extraction for this mesh
         densities = GND_map[rows, cols]
@@ -384,10 +344,13 @@ def compute_interaction_stress_mura(QQ_smeared, C_tensor, eps_tensor, delta_tens
         # global = x * u + y * v
         glob_xi = np.outer(loc_xi[:, 0], u_vec) + np.outer(loc_xi[:, 1], v_vec)
 
-        # Normalize
+        # Normalize Tangents
         norms = np.linalg.norm(glob_xi, axis=1)
         valid_norm = norms > 1e-12
-        glob_xi[valid_norm] = glob_xi[valid_norm] / norms[valid_norm, None]
+
+        # Initialize with zeros
+        glob_xi_normalized = np.zeros_like(glob_xi)
+        glob_xi_normalized[valid_norm] = glob_xi[valid_norm] / norms[valid_norm, None]
 
         # Append to lists
         source_coords_list.append(positions)
@@ -395,7 +358,7 @@ def compute_interaction_stress_mura(QQ_smeared, C_tensor, eps_tensor, delta_tens
         # Normal is constant for the whole mesh
         normals = np.tile(n_vec_global, (len(densities), 1))
         source_norm_list.append(normals)
-        source_tan_list.append(glob_xi)
+        source_tan_list.append(glob_xi_normalized)
 
     if not source_coords_list:
         print("  ! No sources found above density cutoff.")
@@ -423,7 +386,7 @@ def compute_interaction_stress_mura(QQ_smeared, C_tensor, eps_tensor, delta_tens
         Y_target = mesh['y_grid']
         Z_target = mesh['z_grid']
 
-        # Identify valid grid points
+        # Identify valid grid points (Strict NaN check)
         valid_mask = ~np.isnan(X_target)
         target_indices = np.argwhere(valid_mask)  # (N_valid, 2)
 
@@ -475,10 +438,10 @@ def compute_interaction_stress_mura(QQ_smeared, C_tensor, eps_tensor, delta_tens
             # Remap flat results back to (nx, ny) scalar grid
             nx, ny = X_target.shape
 
-            # CHANGE 3: Stress field is now 2D (Scalar field)
+            # Stress field is now 2D (Scalar field)
             stress_field = np.zeros((nx, ny))
 
-            # Assign using advanced indexing
+            # Fill valid points, leave NaNs as 0.0 (or could set to NaN if preferred)
             stress_field[t_rows, t_cols] = computed_stress_flat
 
             # Store results
