@@ -885,3 +885,94 @@ def compute_density_and_theta_maps(generated_loops, nodes_active, b,
 
     print(f"Computation complete. Generated 3D maps for {len(QQ)} loops.")
     return QQ
+
+
+import numpy as np
+
+
+def smear_configurational_density(QQ_input, nthetaintervals, std_dev_rad=(5 * np.pi / 180)):
+    """
+    Smears the dislocation density in theta-space (configurational space) using a
+    Gaussian distribution. It processes the dictionary output from
+    compute_density_and_theta_maps and handles multiple slip systems.
+
+    Args:
+        QQ_input (dict): The dictionary returned by compute_density_and_theta_maps.
+                         Keys are loop indices, values contain 'density_map' (nx, ny, ntheta).
+        nthetaintervals (int): Total number of theta bins (e.g., 360).
+        std_dev_rad (float): Standard deviation for the Gaussian kernel in radians.
+                             Default is 5 degrees (5 * pi / 180).
+
+    Returns:
+        dict: A new dictionary with the same structure as QQ_input, but with
+              smeared density maps.
+    """
+    print(f"\n--- Smearing Density in Theta Space (std={std_dev_rad:.4f} rad) ---")
+
+    # 1. Generate the Gaussian Kernel
+    # Calculate angular step size
+    d_theta = 2 * np.pi / nthetaintervals
+
+    # Determine how many bins out to calculate (5 sigma covers >99.9%)
+    n_dist = int(np.ceil(5 * std_dev_rad / d_theta))
+
+    # Create an array of integer offsets [-n, ..., 0, ..., +n]
+    kernel_indices = np.arange(-n_dist, n_dist + 1)
+
+    # Convert offsets to physical angles for Gaussian calculation
+    dist_vals = kernel_indices * d_theta
+
+    # Calculate Gaussian coefficients
+    kernel = (1 / (np.sqrt(2 * np.pi * std_dev_rad ** 2))) * np.exp(-(dist_vals ** 2) / (2 * std_dev_rad ** 2))
+
+    # Normalize kernel so total probability sum is 1.0 (conserves density)
+    kernel = kernel / np.sum(kernel)
+
+    print(f"Kernel size: {len(kernel)} bins (spanning +/- {n_dist} bins)")
+
+    QQ_smeared = {}
+
+    # 2. Iterate through every loop/slip system in the input dictionary
+    for key, data in QQ_input.items():
+
+        # Extract the raw "sharp" map: shape (nx, ny, nthetaintervals)
+        raw_map = data['density_map']
+
+        # Initialize the new smeared map
+        smeared_map = np.zeros_like(raw_map)
+
+        # 3. Apply Circular Convolution along the Theta axis
+        # We iterate through every 'source' theta bin. If there is density there,
+        # we spread it to the 'target' neighbor bins based on the kernel.
+
+        for t_source in range(nthetaintervals):
+            # Optimization: Extract the 2D slice for this specific angle
+            source_slice = raw_map[:, :, t_source]
+
+            # If this angle has no dislocations, skip calculation
+            if np.sum(source_slice) == 0:
+                continue
+
+            # Distribute this density to neighbors
+            for k_idx, offset in enumerate(kernel_indices):
+                weight = kernel[k_idx]
+
+                # Calculate target bin index with circular wrapping (modulo)
+                # e.g., if t_source is 359 and offset is +1, t_target becomes 0
+                t_target = (t_source + offset) % nthetaintervals
+
+                # Add weighted density to the target bin
+                smeared_map[:, :, t_target] += source_slice * weight
+
+        # 4. Store Data in Output Dictionary
+        # Preserving all ID tags (Slip plane ID, Slip system ID, Stack ID)
+        QQ_smeared[key] = {
+            "density_map": smeared_map,
+            "normal_id": data['normal_id'],  # Slip Plane ID (0-3)
+            "stack_id": data['stack_id'],  # Stack ID
+            "slip_system_id": data['slip_system_id'],  # Slip System ID (0-2)
+            "burgers_vector": data['burgers_vector']
+        }
+
+    print("Smearing complete.")
+    return QQ_smeared

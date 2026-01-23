@@ -17,7 +17,8 @@ from fcc_lib import (
     calculate_rss_and_activity,
     reconstruct_active_slip_planes,
     generate_dislocation_loops_per_system,
-    compute_density_and_theta_maps
+    compute_density_and_theta_maps,
+    smear_configurational_density
 
 )
 
@@ -143,38 +144,46 @@ loops = generate_dislocation_loops_per_system(
 # 2. Compute 3D Density/Theta Maps
 
 
+# 2. Compute 3D Density/Theta Maps
 QQ = compute_density_and_theta_maps(
     loops,
     nodes_active,
     b,
-    nthetaintervals=nthetaintervals,  # Pass the new parameter
+    nthetaintervals=nthetaintervals,
     std_dev_mult=600,
     cutoff_mult=5
 )
 
-# Optional: Inspect the result
-if QQ:
-    first_loop_key = list(QQ.keys())[0]
-    data = QQ[first_loop_key]
-    d_map = data['density_map']
+# =============================================================================
+# 3. SMEARING IN CONFIGURATIONAL SPACE (NEW STEP)
+# =============================================================================
 
-    print(f"Loop {first_loop_key} Map Shape: {d_map.shape}")
-    # Shape should be (nx, ny, 18)
+# Define standard deviation: 5 degrees in radians
+std_dev_theta = 5 * np.pi / 180
 
-    # To see total density (summed over all angles):
-    total_density = np.sum(d_map, axis=2)
+# Call the new function
+QQ_coarse = smear_configurational_density(QQ, nthetaintervals, std_dev_rad=std_dev_theta)
 
-    import matplotlib.pyplot as plt
+# =============================================================================
+# VISUALIZATION CHECK
+# =============================================================================
+if QQ_coarse:
+    first_key = list(QQ_coarse.keys())[0]
 
-    plt.figure()
-    plt.imshow(total_density, origin='lower')
-    plt.title("Total Dislocation Density (Summed over Theta)")
-    plt.colorbar()
+    # Compare raw vs smeared for a specific pixel that has density
+    raw_data = QQ[first_key]['density_map']
+    smeared_data = QQ_coarse[first_key]['density_map']
+
+    # Sum over spatial dimensions to see the angular distribution profile
+    angular_profile_raw = np.sum(raw_data, axis=(0, 1))
+    angular_profile_smeared = np.sum(smeared_data, axis=(0, 1))
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(angular_profile_raw, label='Raw (Sharp)', linestyle='--')
+    plt.plot(angular_profile_smeared, label='Smeared (Gaussian)', linewidth=2)
+    plt.title(f"Angular Distribution Profile (Loop {first_key})")
+    plt.xlabel("Theta Bin Index")
+    plt.ylabel("Total Density")
+    plt.legend()
     plt.show()
 
-    # To see density of a specific angle bin (e.g., bin 0, 0-20 degrees):
-    plt.figure()
-    plt.imshow(d_map[:, :, 0], origin='lower')
-    plt.title(f"Density for Theta Bin 0 (approx 0-{360 / nthetaintervals:.1f} deg)")
-    plt.colorbar()
-    plt.show()
