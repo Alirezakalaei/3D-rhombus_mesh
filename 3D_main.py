@@ -42,19 +42,20 @@ from threeD_stress import (get_elastic_constants,compute_interaction_stress_mura
 print("--- 1. Setting up parameters ---")
 b = 2.56*(10**-10)  # Lattice constant (e.g., for Copper in Angstroms)
 target_density= 10**11
-d = 500*b
+d = 200*b
 CRSS = .5*10**6
 app_load = 20*10**6
 mu = 46e9 #Pa
 nu = .34
 a= 1*b # singularity removal
-min_density_val = 1e5 #m^-2
-cutoff_dist_val = 4000*b
+min_density_val = 1e9 #m^-2
+cutoff_dist_val = 5000*b
 
 load_direction= np.array([0, 0, 1])
 b_vecs = calculate_tetrahedron_slip_systems(b)
-box_edge_length = 20000 * b
+box_edge_length = 10000 * b
 n_grid = np.ceil(box_edge_length / d)
+minimum_valid_points = np.ceil((n_grid*n_grid)/1)
 nthetaintervals = 360  # Example: Divide 0-360 degrees into 18 bins (20 degrees each)
 # =============================================================================
 # 2. EXECUTE COMPUTATIONAL STEPS
@@ -130,7 +131,7 @@ for i in range(slip_plane_ids.shape[0]):
 
 rss, active_s =calculate_rss_and_activity(load_direction, app_load, CRSS, b_vecs)
 
-nodes_active= reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ, (box_edge_length,box_edge_length,box_edge_length))
+nodes_active= reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ, (box_edge_length,box_edge_length,box_edge_length), minimum_valid_points)
 ##############################
 # now we will make the dislocation loops
 
@@ -211,8 +212,10 @@ interaction_stress_data = compute_interaction_stress_mura(
     mu,  # Mu
     nu,  # Nu
     a,  # 'a' parameter
+    dv,
     cut_off_dist=cutoff_dist_val,
-    min_cut_off_density=min_density_val
+    min_cut_off_density=min_density_val,
+
 )
 
 # =============================================================================
@@ -220,7 +223,7 @@ interaction_stress_data = compute_interaction_stress_mura(
 # =============================================================================
 if interaction_stress_data:
     # Example: Visualize stress for the first available system
-    first_key = list(interaction_stress_data.keys())[3]
+    first_key = list(interaction_stress_data.keys())[0]
     data_entry = interaction_stress_data[first_key]
 
     stress_map = data_entry['stress_field']

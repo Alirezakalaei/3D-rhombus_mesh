@@ -3,456 +3,279 @@ from numba import njit, prange
 from scipy.spatial import cKDTree
 
 
-# =============================================================================
-# HELPER FUNCTIONS (TENSORS)
-# =============================================================================
-
-def get_elastic_constants(mu, nu):
-    """Constructs the isotropic elastic stiffness tensor C_ijkl."""
-    C = np.zeros((3, 3, 3, 3))
-    lam = 2 * mu * nu / (1 - 2 * nu)
-
-    for i in range(3):
-        for j in range(3):
-            for k in range(3):
-                for l in range(3):
-                    delta_ij = 1.0 if i == j else 0.0
-                    delta_kl = 1.0 if k == l else 0.0
-                    delta_ik = 1.0 if i == k else 0.0
-                    delta_jl = 1.0 if j == l else 0.0
-                    delta_il = 1.0 if i == l else 0.0
-                    delta_jk = 1.0 if j == k else 0.0
-
-                    C[i, j, k, l] = lam * delta_ij * delta_kl + mu * (delta_ik * delta_jl + delta_il * delta_jk)
-    return C
-
-
-def get_epsilon_delta():
-    """Returns the Levi-Civita tensor and Kronecker delta."""
-    epsilon = np.zeros((3, 3, 3))
-    delta = np.eye(3)
-
-    epsilon[0, 1, 2] = epsilon[1, 2, 0] = epsilon[2, 0, 1] = 1.0
-    epsilon[0, 2, 1] = epsilon[2, 1, 0] = epsilon[1, 0, 2] = -1.0
-
-    return epsilon, delta
-
-
-# =============================================================================
-# GND AND TANGENT COMPUTATION
-# =============================================================================
-
-@njit(fastmath=True)
-def compute_gnd_and_xi_single_plane(density_map, theta_array):
-    """
-    Compute GND density and tangent vector xi for a SINGLE plane/stack.
-    """
-    nx, ny, n_thet = density_map.shape
-    GND = np.zeros((nx, ny))
-    xi_local = np.zeros((nx, ny, 3))
-
-    cos_theta = np.cos(theta_array)
-    sin_theta = np.sin(theta_array)
-
-    for i in range(nx):
-        for j in range(ny):
-            vec_x = 0.0
-            vec_y = 0.0
-
-            for k in range(n_thet):
-                rho = density_map[i, j, k]
-                vec_x += rho * cos_theta[k]
-                vec_y += rho * sin_theta[k]
-
-            mag = np.sqrt(vec_x ** 2 + vec_y ** 2)
-            GND[i, j] = mag
-
-            if mag > 1e-12:
-                xi_local[i, j, 0] = vec_x / mag
-                xi_local[i, j, 1] = vec_y / mag
-                xi_local[i, j, 2] = 0.0
-            else:
-                xi_local[i, j, 0] = 0.0
-                xi_local[i, j, 1] = 0.0
-                xi_local[i, j, 2] = 0.0
-
-    return GND, xi_local
-
-
-# =============================================================================
-# PARALLEL KERNEL
-# =============================================================================
-
 @njit(parallel=True, fastmath=True)
-def compute_stress_batch(
-        target_coords,  # (N_targets, 3)
-        neighbor_offsets,  # (N_targets + 1,)
-        neighbor_indices,  # (Total_interactions,)
-        source_coords,  # (N_sources, 3)
-        source_densities,  # (N_sources,)
-        source_normals,  # (N_sources, 3)
-        source_tangents,  # (N_sources, 3) - This is xi (vector)
-        b_prime,  # (3,)
-        C, epsilon_tens, delta,
-        mu, nu, a
-):
-    """
-    Computes the scalar resolved shear stress at target points.
-    Performs the projection (dot product) of the Mura vector onto the source tangent vector.
-    """
+def compute_stress_cai_flattened(target_coords, target_burgers, target_normals, neighbor_offsets, neighbor_indices,
+                                 source_coords, source_densities, source_burgers, source_tangents, mu, nu, a, dv):
     n_targets = target_coords.shape[0]
-    results = np.zeros(n_targets)
+    results = np.zeros(n_targets, dtype=np.float64)
+    factor1 = mu / (8.0 * np.pi);
+    factor2 = mu / (4.0 * np.pi * (1.0 - nu))
 
-    prefactor_base = 1.0 / (16.0 * np.pi * mu * (1.0 - nu))
-
-    # Pre-calculate constants to avoid re-computing in inner loop
-    term1_const = 6.0 * a ** 2 * (1.0 - nu)
-    term2_const = (3.0 - 4.0 * nu)
-
-    # Parallel loop over targets
     for t_idx in prange(n_targets):
-
-        t_pos = target_coords[t_idx]
-
-        # Get neighbors for this target
-        start = neighbor_offsets[t_idx]
+        t_pos = target_coords[t_idx];
+        t_b = target_burgers[t_idx];
+        t_n = target_normals[t_idx]
+        start = neighbor_offsets[t_idx];
         end = neighbor_offsets[t_idx + 1]
-
-        local_val = 0.0  # Scalar accumulator
+        sigma_xx = 0.0;
+        sigma_yy = 0.0;
+        sigma_zz = 0.0;
+        sigma_xy = 0.0;
+        sigma_yz = 0.0;
+        sigma_zx = 0.0
 
         for k in range(start, end):
             src_idx = neighbor_indices[k]
+            rho = source_densities[src_idx]
+            if rho <= 1e-12: continue
 
             s_pos = source_coords[src_idx]
-
-            # Distance check
-            dx = t_pos[0] - s_pos[0]
-            dy = t_pos[1] - s_pos[1]
+            dx = t_pos[0] - s_pos[0];
+            dy = t_pos[1] - s_pos[1];
             dz = t_pos[2] - s_pos[2]
-            dist_sq = dx * dx + dy * dy + dz * dz
+            R2 = dx * dx + dy * dy + dz * dz;
+            Ra2 = R2 + a * a;
+            Ra = np.sqrt(Ra2);
+            Ra3 = Ra2 * Ra;
+            Ra5 = Ra3 * Ra2
+            b_vec = source_burgers[src_idx];
+            xi_vec = source_tangents[src_idx]
 
-            # Safety check for regularization
-            R2 = dist_sq + a ** 2
-            if R2 < 1e-20: continue  # Prevent division by zero
+            lap_Ra = (2.0 * R2 + 3.0 * a * a) / Ra3
+            grad_lap_Ra_factor = (-2.0 * R2 - 5.0 * a * a) / Ra5
+            d_i_lap_Ra_x = dx * grad_lap_Ra_factor;
+            d_i_lap_Ra_y = dy * grad_lap_Ra_factor;
+            d_i_lap_Ra_z = dz * grad_lap_Ra_factor
 
-            rho = source_densities[src_idx]
-            n_alpha = source_normals[src_idx]
-            xi_alpha = source_tangents[src_idx]
+            C_x = b_vec[1] * xi_vec[2] - b_vec[2] * xi_vec[1]
+            C_y = b_vec[2] * xi_vec[0] - b_vec[0] * xi_vec[2]
+            C_z = b_vec[0] * xi_vec[1] - b_vec[1] * xi_vec[0]
+            T1_xx = 2.0 * C_x * d_i_lap_Ra_x;
+            T1_yy = 2.0 * C_y * d_i_lap_Ra_y;
+            T1_zz = 2.0 * C_z * d_i_lap_Ra_z
+            T1_xy = C_x * d_i_lap_Ra_y + C_y * d_i_lap_Ra_x;
+            T1_yz = C_y * d_i_lap_Ra_z + C_z * d_i_lap_Ra_y;
+            T1_zx = C_z * d_i_lap_Ra_x + C_x * d_i_lap_Ra_z
 
-            # --- Inline Mura G Tensor Calculation ---
-            R = np.sqrt(R2)
-            invR3 = 1.0 / (R2 * R)
-            invR5 = 1.0 / (R2 * R2 * R)
+            C_dot_x = C_x * dx + C_y * dy + C_z * dz;
+            invRa3 = 1.0 / Ra3;
+            invRa5 = 1.0 / Ra5
+            D3_xx = - (C_dot_x + 2.0 * C_x * dx) * invRa3 + 3.0 * C_dot_x * dx * dx * invRa5
+            D3_yy = - (C_dot_x + 2.0 * C_y * dy) * invRa3 + 3.0 * C_dot_x * dy * dy * invRa5
+            D3_zz = - (C_dot_x + 2.0 * C_z * dz) * invRa3 + 3.0 * C_dot_x * dz * dz * invRa5
+            D3_xy = - (C_x * dy + C_y * dx) * invRa3 + 3.0 * C_dot_x * dx * dy * invRa5
+            D3_yz = - (C_y * dz + C_z * dy) * invRa3 + 3.0 * C_dot_x * dy * dz * invRa5
+            D3_zx = - (C_z * dx + C_x * dz) * invRa3 + 3.0 * C_dot_x * dz * dx * invRa5
+            C_dot_grad_lap = C_x * d_i_lap_Ra_x + C_y * d_i_lap_Ra_y + C_z * d_i_lap_Ra_z
+            T2_xx = D3_xx - C_dot_grad_lap;
+            T2_yy = D3_yy - C_dot_grad_lap;
+            T2_zz = D3_zz - C_dot_grad_lap
+            T2_xy = D3_xy;
+            T2_yz = D3_yz;
+            T2_zx = D3_zx
 
-            g_h_0 = 0.0
-            g_h_1 = 0.0
-            g_h_2 = 0.0
+            scale = rho * dv
+            sigma_xx += scale * (factor1 * T1_xx + factor2 * T2_xx)
+            sigma_yy += scale * (factor1 * T1_yy + factor2 * T2_yy)
+            sigma_zz += scale * (factor1 * T1_zz + factor2 * T2_zz)
+            sigma_xy += scale * (factor1 * T1_xy + factor2 * T2_xy)
+            sigma_yz += scale * (factor1 * T1_yz + factor2 * T2_yz)
+            sigma_zx += scale * (factor1 * T1_zx + factor2 * T2_zx)
 
-            # Unrolled loops for specific tensor contractions would be faster, 
-            # but we keep the structure generic for correctness with the C tensor.
-
-            # We iterate h (0,1,2)
-            for h in range(3):
-                total_h = 0.0
-
-                # Iterate p, q
-                for p in range(3):
-                    np_p = n_alpha[p]
-                    if np_p == 0: continue
-
-                    for q in range(3):
-                        vec_q = xi_alpha[q]
-                        if vec_q == 0: continue
-
-                        # Iterate r, s
-                        for r_i in range(3):
-                            for s in range(3):
-                                C_pqrs = C[p, q, r_i, s]
-                                if abs(C_pqrs) < 1e-12: continue
-
-                                coeff = np_p * vec_q * C_pqrs * prefactor_base
-
-                                # Iterate j
-                                for j in range(3):
-                                    eps_jsh = epsilon_tens[j, s, h]
-                                    if eps_jsh == 0: continue
-
-                                    # Iterate i
-                                    for i in range(3):
-                                        bi_p = b_prime[i]
-                                        if bi_p == 0: continue
-
-                                        # Iterate k, l
-                                        for k_idx in range(3):
-                                            x_k = dx if k_idx == 0 else (dy if k_idx == 1 else dz)
-
-                                            for l in range(3):
-                                                x_l = dx if l == 0 else (dy if l == 1 else dz)
-                                                x_r = dx if r_i == 0 else (dy if r_i == 1 else dz)
-
-                                                Cijkl = C[i, j, k_idx, l]
-                                                if abs(Cijkl) < 1e-12: continue
-
-                                                delta_rk = delta[r_i, k_idx]
-                                                delta_rl = delta[r_i, l]
-                                                delta_kl = delta[k_idx, l]
-
-                                                term1 = delta_rk * term1_const * x_l * invR5
-                                                term2 = term2_const * delta_rk * x_l * invR3
-                                                term3 = 3.0 * x_r * x_k * x_l * invR5
-                                                term4 = - (delta_rl * x_k + delta_kl * x_r) * invR3
-
-                                                bracket = term1 + term2 + term3 + term4
-                                                total_h += coeff * eps_jsh * bi_p * Cijkl * bracket
-
-                if h == 0:
-                    g_h_0 = total_h
-                elif h == 1:
-                    g_h_1 = total_h
-                else:
-                    g_h_2 = total_h
-
-            # Dot Product with xi_alpha
-            dot_val = g_h_0 * xi_alpha[0] + g_h_1 * xi_alpha[1] + g_h_2 * xi_alpha[2]
-            local_val += rho * dot_val
-
-        results[t_idx] = -local_val
-
+        t_x = sigma_xx * t_n[0] + sigma_xy * t_n[1] + sigma_zx * t_n[2]
+        t_y = sigma_xy * t_n[0] + sigma_yy * t_n[1] + sigma_yz * t_n[2]
+        t_z = sigma_zx * t_n[0] + sigma_yz * t_n[1] + sigma_zz * t_n[2]
+        results[t_idx] = t_x * t_b[0] + t_y * t_b[1] + t_z * t_b[2]
     return results
 
 
-# =============================================================================
-# MAIN COMPUTATION FUNCTION
-# =============================================================================
+@njit(fastmath=True)
+def compute_gnd_and_xi_single_plane(density_map, theta_array):
+    nx, ny, n_thet = density_map.shape
+    GND = np.zeros((nx, ny))
+    xi_local = np.zeros((nx, ny, 3))
+    cos_theta = np.cos(theta_array);
+    sin_theta = np.sin(theta_array)
+    for i in range(nx):
+        for j in range(ny):
+            if np.isnan(density_map[i, j, 0]): GND[i, j] = 0.0; continue
+            vec_x = 0.0;
+            vec_y = 0.0
+            for k in range(n_thet):
+                rho = density_map[i, j, k]
+                vec_x += rho * cos_theta[k];
+                vec_y += rho * sin_theta[k]
+            mag = np.sqrt(vec_x ** 2 + vec_y ** 2)
+            GND[i, j] = mag
+            if mag > 1e-12: xi_local[i, j, 0] = vec_x / mag; xi_local[i, j, 1] = vec_y / mag
+    return GND, xi_local
+
+
+def get_elastic_constants(mu, nu): return np.zeros((3, 3, 3, 3))
+
+
+def get_epsilon_delta(): return np.zeros((3, 3, 3)), np.eye(3)
+
 
 def compute_interaction_stress_mura(QQ_smeared, C_tensor, eps_tensor, delta_tensor, nodes_active, b_vecs, b, mu, nu,
-                                    a_param,
-                                    cut_off_dist=3000, min_cut_off_density=1e9):
-    """
-    Computes Mura interaction stress using computed GND and Tangent vectors (xi).
-    Parallelized and optimized. Returns a scalar stress field per slip system.
-    """
-    print(f"\n--- Computing Mura Interaction Stress (a={a_param:.2e}, cutoff={cut_off_dist:.2e}) ---")
+                                    a_param, dvol, cut_off_dist=3000, min_cut_off_density=1e9):
+    print(f"\n--- Computing Interaction Stress (Strict Active-Only) ---")
 
-    # 1. PREPARE SOURCES
-    # ------------------
-    source_coords_list = []
-    source_dens_list = []
-    source_norm_list = []
+    # =========================================================
+    # PHASE 1: FLATTEN SOURCES
+    # =========================================================
+    print("  > Phase 1: Flattening Sources...")
+    source_coords_list = [];
+    source_dens_list = [];
+    source_burgers_list = [];
     source_tan_list = []
+    plane_normals = []
+    for i in range(4):
+        n = b_vecs[i, 0, 0, :];
+        plane_normals.append(n / np.linalg.norm(n))
 
-    # Map (n_id, s_id) -> (X, Y, Z) for fast lookup
     mesh_lookup = {}
     for mesh in nodes_active:
-        nid = int(mesh['slip_plane_normal_id'])
+        nid = int(mesh['slip_plane_normal_id']);
         sid = int(mesh['slip_plane_stack_id'])
         mesh_lookup[(nid, sid)] = (mesh['x_grid'], mesh['y_grid'], mesh['z_grid'])
 
-    # Helper: Get Normal Vectors from b_vecs
-    plane_normals = []
-    for i in range(4):
-        n = b_vecs[i, 0, 0, :]
-        plane_normals.append(n / np.linalg.norm(n))
-
-    # Pre-calculate Theta Array
-    if not QQ_smeared:
-        print("Error: QQ_smeared is empty.")
-        return {}
-
+    if not QQ_smeared: return {}
     first_key = list(QQ_smeared.keys())[0]
     n_theta = QQ_smeared[first_key]['density_map'].shape[2]
     theta_arr = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
 
-    print("  > Extracting Sources (GND & Tangents)...")
-
     for key, data in QQ_smeared.items():
-        n_id = data['normal_id']
+        n_id = data['normal_id'];
         s_id = data['stack_id']
-        n_vec_global = plane_normals[n_id]
-
+        n_vec_global = plane_normals[n_id];
+        b_vec_global = data['burgers_vector']
         if (n_id, s_id) not in mesh_lookup: continue
         X, Y, Z = mesh_lookup[(n_id, s_id)]
 
-        # --- ROBUST BASIS VECTOR CALCULATION ---
-        # Find valid grid points to define u_vec and v_vec.
-        # We cannot assume X[0,0] is valid.
-        u_vec = None
-        v_vec = None
+        helper = np.array([0, 0, 1]) if np.abs(n_vec_global[2]) < 0.9 else np.array([1, 0, 0])
+        u_vec = np.cross(n_vec_global, helper);
+        u_vec /= np.linalg.norm(u_vec)
+        v_vec = np.cross(n_vec_global, u_vec);
+        v_vec /= np.linalg.norm(v_vec)
 
-        # Search for a valid horizontal pair for u_vec
-        # Look for (r, c) and (r, c+1) that are both valid
-        rows_valid, cols_valid = np.where(~np.isnan(X))
-
-        # Try to find u_vec (along columns)
-        for idx in range(len(rows_valid)):
-            r, c = rows_valid[idx], cols_valid[idx]
-            if c + 1 < X.shape[1] and not np.isnan(X[r, c + 1]):
-                u_vec = np.array([X[r, c + 1] - X[r, c], Y[r, c + 1] - Y[r, c], Z[r, c + 1] - Z[r, c]])
-                norm_u = np.linalg.norm(u_vec)
-                if norm_u > 1e-12:
-                    u_vec /= norm_u
-                    break
-
-        # Try to find v_vec (along rows)
-        for idx in range(len(rows_valid)):
-            r, c = rows_valid[idx], cols_valid[idx]
-            if r + 1 < X.shape[0] and not np.isnan(X[r + 1, c]):
-                v_vec = np.array([X[r + 1, c] - X[r, c], Y[r + 1, c] - Y[r, c], Z[r + 1, c] - Z[r, c]])
-                norm_v = np.linalg.norm(v_vec)
-                if norm_v > 1e-12:
-                    v_vec /= norm_v
-                    break
-
-        # Fallback if grid is too sparse or 1D
-        if u_vec is None or v_vec is None:
-            # Construct arbitrary orthogonal basis from normal
-            if np.abs(n_vec_global[2]) < 0.9:
-                helper = np.array([0, 0, 1])
-            else:
-                helper = np.array([1, 0, 0])
-            u_vec = np.cross(n_vec_global, helper)
-            u_vec /= np.linalg.norm(u_vec)
-            v_vec = np.cross(n_vec_global, u_vec)
-            v_vec /= np.linalg.norm(v_vec)
-
-        # ---------------------------------------
-
-        # Compute GND and Local Tangent
         GND_map, xi_local_map = compute_gnd_and_xi_single_plane(data['density_map'], theta_arr)
-
-        # Filter by cutoff density AND valid coordinates
-        # Crucial: Ensure we don't pick up NaN coordinates even if density is somehow high
-        valid_coords_mask = ~np.isnan(X)
-        high_density_mask = GND_map > min_cut_off_density
-        combined_mask = valid_coords_mask & high_density_mask
-
+        valid_coords_mask = (~np.isnan(X)) & (~np.isnan(Y)) & (~np.isnan(Z))
+        valid_density_mask = (GND_map > min_cut_off_density) & (GND_map > 0.0)
+        combined_mask = valid_coords_mask & valid_density_mask
         rows, cols = np.where(combined_mask)
-
         if len(rows) == 0: continue
 
-        # Vectorized extraction for this mesh
         densities = GND_map[rows, cols]
-
-        # Positions
-        pos_x = X[rows, cols]
-        pos_y = Y[rows, cols]
-        pos_z = Z[rows, cols]
-        positions = np.column_stack((pos_x, pos_y, pos_z))
-
-        # Tangents (Rotation)
-        loc_xi = xi_local_map[rows, cols]  # (N, 3)
-        # global = x * u + y * v
+        positions = np.column_stack((X[rows, cols], Y[rows, cols], Z[rows, cols]))
+        loc_xi = xi_local_map[rows, cols]
         glob_xi = np.outer(loc_xi[:, 0], u_vec) + np.outer(loc_xi[:, 1], v_vec)
-
-        # Normalize Tangents
         norms = np.linalg.norm(glob_xi, axis=1)
         valid_norm = norms > 1e-12
+        glob_xi[valid_norm] = glob_xi[valid_norm] / norms[valid_norm, None]
+        glob_xi[~valid_norm] = 0.0
 
-        # Initialize with zeros
-        glob_xi_normalized = np.zeros_like(glob_xi)
-        glob_xi_normalized[valid_norm] = glob_xi[valid_norm] / norms[valid_norm, None]
-
-        # Append to lists
-        source_coords_list.append(positions)
+        source_coords_list.append(positions);
         source_dens_list.append(densities)
-        # Normal is constant for the whole mesh
-        normals = np.tile(n_vec_global, (len(densities), 1))
-        source_norm_list.append(normals)
-        source_tan_list.append(glob_xi_normalized)
+        source_tan_list.append(glob_xi);
+        source_burgers_list.append(np.tile(b_vec_global, (len(densities), 1)))
 
-    if not source_coords_list:
-        print("  ! No sources found above density cutoff.")
-        return {}
-
-    # Flatten source arrays for Numba
-    src_coords_arr = np.vstack(source_coords_list)
-    src_dens_arr = np.concatenate(source_dens_list)
-    src_norm_arr = np.vstack(source_norm_list)
-    src_tan_arr = np.vstack(source_tan_list)
-
-    print(f"  > Built Source Tree: {len(src_coords_arr)} sources.")
+    if not source_coords_list: print("  ! No valid sources found."); return {}
+    src_coords_arr = np.vstack(source_coords_list).astype(np.float64)
+    src_dens_arr = np.concatenate(source_dens_list).astype(np.float64)
+    src_tan_arr = np.vstack(source_tan_list).astype(np.float64)
+    src_burgers_arr = np.vstack(source_burgers_list).astype(np.float64)
+    print(f"    > Total Source Points: {len(src_coords_arr)}")
     source_tree = cKDTree(src_coords_arr)
 
-    # 2. COMPUTE TARGETS
-    # ------------------
-    stress_results = {}
-    print(f"  > Computing targets for {len(nodes_active)} active stacks...")
+    # =========================================================
+    # PHASE 2: FLATTEN TARGETS (STRICTLY ACTIVE ONLY)
+    # =========================================================
+    print("  > Phase 2: Flattening Targets...")
+    target_coords_list = [];
+    target_burgers_list = [];
+    target_normals_list = [];
+    reconstruction_map = []
+    current_idx = 0
 
     for mesh in nodes_active:
-        n_id_target = int(mesh['slip_plane_normal_id'])
-        s_id_target = int(mesh['slip_plane_stack_id'])
+        n_id = int(mesh['slip_plane_normal_id'])
+        s_id = int(mesh['slip_plane_stack_id'])
+        X = mesh['x_grid'];
+        Y = mesh['y_grid'];
+        Z = mesh['z_grid']
+        valid_mask = (~np.isnan(X)) & (~np.isnan(Y)) & (~np.isnan(Z))
+        rows, cols = np.where(valid_mask)
+        if len(rows) == 0: continue
+        mesh_coords = np.column_stack((X[rows, cols], Y[rows, cols], Z[rows, cols]))
+        n_points = len(mesh_coords)
+        n_vec = plane_normals[n_id]
+        n_vec_repeated = np.tile(n_vec, (n_points, 1))
 
-        X_target = mesh['x_grid']
-        Y_target = mesh['y_grid']
-        Z_target = mesh['z_grid']
+        # --- CRITICAL FIX: ONLY LOOP OVER ACTIVE SYSTEMS ---
+        # We retrieve the list of active systems specifically for this plane
+        # stored during the reconstruction phase.
+        active_systems = mesh.get('active_slip_system_ids', [])
 
-        # Identify valid grid points (Strict NaN check)
-        valid_mask = ~np.isnan(X_target)
-        target_indices = np.argwhere(valid_mask)  # (N_valid, 2)
+        for sys_id in active_systems:
+            sys_id = int(sys_id)
+            b_vec = b_vecs[n_id, sys_id, 1, :]
+            b_vec_repeated = np.tile(b_vec, (n_points, 1))
 
-        if len(target_indices) == 0: continue
+            target_coords_list.append(mesh_coords)
+            target_normals_list.append(n_vec_repeated)
+            target_burgers_list.append(b_vec_repeated)
 
-        # Extract target coordinates
-        t_rows = target_indices[:, 0]
-        t_cols = target_indices[:, 1]
-        t_pos_x = X_target[t_rows, t_cols]
-        t_pos_y = Y_target[t_rows, t_cols]
-        t_pos_z = Z_target[t_rows, t_cols]
-        target_coords_arr = np.column_stack((t_pos_x, t_pos_y, t_pos_z))
+            reconstruction_map.append({
+                'key': (n_id, s_id, sys_id),
+                'shape': X.shape, 'rows': rows, 'cols': cols,
+                'start': current_idx, 'end': current_idx + n_points,
+                'burgers_vector': b_vec
+            })
+            current_idx += n_points
 
-        # QUERY TREE (Vectorized)
-        neighbor_lists = source_tree.query_ball_point(target_coords_arr, cut_off_dist)
+    if not target_coords_list: return {}
+    tgt_coords_arr = np.vstack(target_coords_list).astype(np.float64)
+    tgt_norm_arr = np.vstack(target_normals_list).astype(np.float64)
+    tgt_burg_arr = np.vstack(target_burgers_list).astype(np.float64)
+    print(f"    > Total Calculation Points: {len(tgt_coords_arr)}")
 
-        # Flatten neighbors for Numba parallelization
-        lengths = np.array([len(l) for l in neighbor_lists], dtype=np.int64)
-        offsets = np.zeros(len(lengths) + 1, dtype=np.int64)
-        offsets[1:] = np.cumsum(lengths)
+    # =========================================================
+    # PHASE 3: COMPUTE
+    # =========================================================
+    print("  > Phase 3: Spatial Query & Numba Execution...")
+    neighbor_lists = source_tree.query_ball_point(tgt_coords_arr, cut_off_dist)
+    lengths = np.array([len(l) for l in neighbor_lists], dtype=np.int64)
+    offsets = np.zeros(len(lengths) + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(lengths)
+    flat_indices = np.array([item for sublist in neighbor_lists for item in sublist], dtype=np.int64) if offsets[
+                                                                                                             -1] > 0 else np.zeros(
+        0, dtype=np.int64)
 
-        if offsets[-1] == 0:
-            flat_indices = np.zeros(0, dtype=np.int64)
-        else:
-            flat_indices = np.array([item for sublist in neighbor_lists for item in sublist], dtype=np.int64)
+    flat_rss_results = compute_stress_cai_flattened(
+        tgt_coords_arr, tgt_burg_arr, tgt_norm_arr, offsets, flat_indices,
+        src_coords_arr, src_dens_arr, src_burgers_arr, src_tan_arr, mu, nu, a_param, dvol
+    )
 
-        # Loop over slip systems
-        for sys_id in range(3):
-            b_prime = b_vecs[n_id_target, sys_id, 1, :]
-
-            # CALL PARALLEL KERNEL
-            if len(flat_indices) > 0:
-                # Returns 1D array of scalars
-                computed_stress_flat = compute_stress_batch(
-                    target_coords_arr,
-                    offsets,
-                    flat_indices,
-                    src_coords_arr,
-                    src_dens_arr,
-                    src_norm_arr,
-                    src_tan_arr,
-                    b_prime,
-                    C_tensor, eps_tensor, delta_tensor,
-                    mu, nu, a_param
-                )
-            else:
-                computed_stress_flat = np.zeros(len(target_coords_arr))
-
-            # Remap flat results back to (nx, ny) scalar grid
-            nx, ny = X_target.shape
-
-            # Stress field is now 2D (Scalar field)
-            stress_field = np.zeros((nx, ny))
-
-            # Fill valid points, leave NaNs as 0.0 (or could set to NaN if preferred)
-            stress_field[t_rows, t_cols] = computed_stress_flat
-
-            # Store results
-            result_key = (n_id_target, s_id_target, sys_id)
-            stress_results[result_key] = {
-                "stress_field": stress_field,
-                "slip_plane_normal_id": n_id_target,
-                "slip_plane_stack_id": s_id_target,
-                "slip_system_id": sys_id,
-                "burgers_vector": b_prime
-            }
-
-    print("  > Computation Complete.")
+    # =========================================================
+    # PHASE 4: RECONSTRUCT
+    # =========================================================
+    print("  > Phase 4: Reconstructing Dictionaries...")
+    stress_results = {}
+    for item in reconstruction_map:
+        key = item['key'];
+        start = item['start'];
+        end = item['end']
+        values = flat_rss_results[start:end]
+        nx, ny = item['shape']
+        stress_field = np.zeros((nx, ny))
+        rows = item['rows'];
+        cols = item['cols']
+        stress_field[rows, cols] = values
+        stress_results[key] = {
+            "stress_field": stress_field,
+            "slip_plane_normal_id": key[0], "slip_plane_stack_id": key[1], "slip_system_id": key[2],
+            "burgers_vector": item['burgers_vector']
+        }
+    print("  > Done.")
     return stress_results
