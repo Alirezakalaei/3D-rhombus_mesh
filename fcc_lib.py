@@ -245,98 +245,156 @@ def calculate_rss_and_activity(loading_dir, load_val, crss, slip_systems):
 # 5. MESH RECONSTRUCTION
 # =============================================================================
 
-def structured_mesh_from_fcc_plane(points, tolerance=1e-15):
-    """ Reconstructs a structured grid from points. """
-    num_points = len(points)
-    if num_points < 5: return None, None, None, None, None
+import numpy as np
+from scipy.spatial.distance import cdist
 
-    # Determine Basis
+
+def structured_mesh_from_fcc_plane(points, tolerance=1e-15):
+    """
+    Reconstructs a structured grid from points on an FCC {111} plane.
+    This modified version also crops empty (all-NaN) rows and columns from the final grid.
+    """
+    num_points = len(points)
+    # The minimum number of points required for reconstruction logic to proceed.
+    # This is different from the user-defined 'min_num' which is a quality filter.
+    if num_points < 5:
+        return None, None, None, None, None
+
+    # --- Determine Basis Vectors ---
+    # Take a subset of points to efficiently find the nearest-neighbor distance.
     subset = points[:min(50, num_points)]
     dists = cdist(subset, subset)
+    # Filter out zero distances (point to itself)
     valid_dists = dists[dists > 1e-8]
-    if len(valid_dists) == 0: return None, None, None, None, None
+    if len(valid_dists) == 0:
+        return None, None, None, None, None
     nn_dist = np.min(valid_dists)
 
     a1, a2, found_basis = None, None, False
 
-    # Try to find 120 degree neighbors
+    # Try to find basis vectors with a 120-degree angle between them.
+    # This is characteristic of vectors connecting a central atom to two of its
+    # neighbors in an FCC {111} plane.
     for i in range(min(10, num_points)):
         p0 = points[i]
         dist_from_p0 = np.linalg.norm(points - p0, axis=1)
         neighbor_indices = np.where((dist_from_p0 > nn_dist * 0.95) & (dist_from_p0 < nn_dist * 1.05))[0]
-        if len(neighbor_indices) < 2: continue
+        if len(neighbor_indices) < 2:
+            continue
 
         vecs = points[neighbor_indices] - p0
-        unit_vecs = vecs / np.linalg.norm(vecs, axis=1)[:, None]
+        unit_vecs = vecs / np.linalg.norm(vecs, axis=1)[:, np.newaxis]
 
         for j in range(len(unit_vecs)):
             for k in range(j + 1, len(unit_vecs)):
                 dot = np.dot(unit_vecs[j], unit_vecs[k])
-                if -0.6 < dot < -0.4:  # ~120 deg
+                # cos(120°) = -0.5. We allow for some tolerance.
+                if -0.6 < dot < -0.4:
                     a1, a2 = vecs[j], vecs[k]
-                    found_basis = True;
+                    found_basis = True
                     break
             if found_basis: break
         if found_basis: break
 
-    if not found_basis:  # Fallback to 60 deg
+    # Fallback: If 120-degree vectors aren't found, try to find 60-degree vectors.
+    # This can happen due to the choice of neighbors. A third basis vector can be
+    # constructed from two 60-degree vectors (a3 = a2 - a1).
+    if not found_basis:
         for i in range(min(10, num_points)):
             p0 = points[i]
             dist_from_p0 = np.linalg.norm(points - p0, axis=1)
             neighbor_indices = np.where((dist_from_p0 > nn_dist * 0.95) & (dist_from_p0 < nn_dist * 1.05))[0]
             if len(neighbor_indices) < 2: continue
             vecs = points[neighbor_indices] - p0
-            unit_vecs = vecs / np.linalg.norm(vecs, axis=1)[:, None]
+            unit_vecs = vecs / np.linalg.norm(vecs, axis=1)[:, np.newaxis]
             for j in range(len(unit_vecs)):
                 for k in range(j + 1, len(unit_vecs)):
+                    # cos(60°) = 0.5. We allow for some tolerance.
                     if 0.4 < np.dot(unit_vecs[j], unit_vecs[k]) < 0.6:
                         a1, a2 = vecs[j], vecs[k] - vecs[j]
-                        found_basis = True;
+                        found_basis = True
                         break
                 if found_basis: break
             if found_basis: break
 
-    if not found_basis: return None, None, None, None, None
+    if not found_basis:
+        return None, None, None, None, None
 
-    # Map to Grid
+    # --- Map Points to a 2D Integer Grid ---
+    # We project the points onto the basis vectors a1, a2 to find their integer indices.
     M = np.column_stack((a1, a2))
     origin = points[0]
     P_rel = (points - origin).T
+    # Solve the system to find the integer coordinates (n1, n2) for each point.
     indices = np.round(np.linalg.inv(M.T @ M) @ M.T @ P_rel).astype(int)
 
     n1, n2 = indices[0, :], indices[1, :]
 
-    # Check fit quality
-    if np.max(np.linalg.norm(points - ((M @ indices).T + origin), axis=1)) > nn_dist * 0.1:
+    # --- Check Fit Quality ---
+    # Reconstruct points from integer indices and check if they are close to the originals.
+    reconstructed_points = (M @ indices).T + origin
+    if np.max(np.linalg.norm(points - reconstructed_points, axis=1)) > nn_dist * 0.1:
         return None, None, None, None, None
 
+    # --- Create Full-Sized Grids ---
+    # Determine the dimensions of the grid needed to hold all points.
     n1_min, n2_min = np.min(n1), np.min(n2)
     dim1, dim2 = np.max(n1) - n1_min + 1, np.max(n2) - n2_min + 1
 
+    # Initialize grids with NaN values.
     x_grid = np.full((dim1, dim2), np.nan)
     y_grid = np.full((dim1, dim2), np.nan)
     z_grid = np.full((dim1, dim2), np.nan)
 
+    # Populate the grids with point coordinates at their respective integer indices.
     x_grid[n1 - n1_min, n2 - n2_min] = points[:, 0]
     y_grid[n1 - n1_min, n2 - n2_min] = points[:, 1]
     z_grid[n1 - n1_min, n2 - n2_min] = points[:, 2]
 
+    # --- NEW: CROP EMPTY ROWS AND COLUMNS ---
+    # This section removes rows and columns that are entirely NaN, making the
+    # returned grid matrices smaller and more memory-efficient.
+
+    # Create a boolean mask where True represents a valid (non-NaN) data point.
+    # We only need to check one grid, as they all share the same NaN pattern.
+    valid_mask = ~np.isnan(x_grid)
+
+    # Find rows that contain at least one valid data point.
+    rows_with_data = np.any(valid_mask, axis=1)
+    # Find columns that contain at least one valid data point.
+    cols_with_data = np.any(valid_mask, axis=0)
+
+    # If there are no rows or columns with data, the grid is empty.
+    if not np.any(rows_with_data) or not np.any(cols_with_data):
+        return None, None, None, None, None
+
+    # Get the integer indices of the rows and columns to keep.
+    ix_rows = np.where(rows_with_data)[0]
+    ix_cols = np.where(cols_with_data)[0]
+
+    # Use np.ix_ to create an open mesh for advanced indexing. This allows us
+    # to select a "sub-grid" defined by the intersection of the desired rows and columns.
+    x_grid = x_grid[np.ix_(ix_rows, ix_cols)]
+    y_grid = y_grid[np.ix_(ix_rows, ix_cols)]
+    z_grid = z_grid[np.ix_(ix_rows, ix_cols)]
+    # --- END OF NEW SECTION ---
+
     return x_grid, y_grid, z_grid, a1, a2
-
-
 
 
 def reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ, box_size, min_num):
     """
-    Reconstructs slip planes.
-    Includes STRICT filtering to prevent massive NaN-filled arrays.
+    Reconstructs slip planes from raw node data.
+    This modified version includes an initial check on the number of nodes
+    to quickly skip planes with insufficient points before reconstruction.
     """
     active_map = {}
     if isinstance(active_s, np.ndarray):
         rows, cols = active_s.shape
         for p in range(rows):
             for d in range(cols):
-                if active_s[p, d] == 1: active_map.setdefault(p, set()).add(d)
+                if active_s[p, d] == 1:
+                    active_map.setdefault(p, set()).add(d)
     else:
         for sys in active_s:
             active_map.setdefault(int(sys[0]), set()).add(int(sys[1]))
@@ -345,45 +403,57 @@ def reconstruct_active_slip_planes(active_s, node_on_slip_sys, XX, YY, ZZ, box_s
     Lx, Ly, Lz = box_size
 
     for (p_type, p_stack_id), indices_list in node_on_slip_sys.items():
-        # --- KEY CHECK: Is this plane type active? ---
-        if p_type not in active_map: continue
+        # Check if this plane type is active.
+        if p_type not in active_map:
+            continue
+
+        # --- NEW: PRE-FILTERING BY NODE COUNT ---
+        # If the number of raw points defining this plane is less than the
+        # minimum required, we skip the expensive reconstruction process entirely.
+        if len(indices_list) < min_num:
+            continue
+        # --- END OF NEW SECTION ---
 
         ids = np.array(indices_list)
-
-        # ---------------------------------------------------------
-        # FIX IS HERE: Filter based on RAW ATOM COUNT first.
-        # If the plane is defined by fewer than 100 atoms, skip it immediately.
-        # ---------------------------------------------------------
-
-
         u, v, w = ids[:, 0], ids[:, 1], ids[:, 2]
         points = np.column_stack((XX[u, v, w], YY[u, v, w], ZZ[u, v, w]))
 
+        # Call the modified function which now returns pre-cropped grids.
         x_grid, y_grid, z_grid, a1, a2 = structured_mesh_from_fcc_plane(points)
-        if x_grid is None: continue
+
+        # If reconstruction failed, continue to the next plane.
+        if x_grid is None:
+            continue
 
         # --- STRICT BOX FILTERING ---
-        # Set anything outside the box to NaN
+        # Set any points in the reconstructed grid that fall outside the
+        # simulation box to NaN.
         out_mask = (x_grid < 0) | (x_grid > Lx) | (y_grid < 0) | (y_grid > Ly) | (z_grid < 0) | (z_grid > Lz)
         x_grid[out_mask] = np.nan
         y_grid[out_mask] = np.nan
         z_grid[out_mask] = np.nan
 
-        valid_mask = ~np.isnan(x_grid)
-        valid_count = np.sum(valid_mask)
-
+        # --- POST-FILTERING CHECKS ---
         # 1. Minimum Mesh Node Count Check
-        # We keep this as a secondary check. Even if we had >100 atoms,
-        # if they are all outside the box (valid_count=0), we should skip.
-        if valid_count < min_num: continue
+        # After filtering points outside the box, we check again if we still
+        # have enough valid points to form a meaningful plane.
+        valid_count = np.sum(~np.isnan(x_grid))
+        if valid_count < min_num:
+            continue
 
-        # 2. Crop Empty Rows/Cols (Bounding Box Optimization)
+        # 2. Crop Empty Rows/Cols (This logic is now inside structured_mesh_from_fcc_plane)
+        # The grids (x_grid, y_grid, z_grid) are already cropped at this point.
+        # We perform one final check: if after box filtering, all points were removed,
+        # the grid might become entirely NaN. We need to crop these newly-emptied
+        # rows/columns as well.
+        valid_mask = ~np.isnan(x_grid)
+        if not np.any(valid_mask):  # If the grid is completely empty now
+            continue
+
         rows_with_data = np.any(valid_mask, axis=1)
         cols_with_data = np.any(valid_mask, axis=0)
-
         ix_rows = np.where(rows_with_data)[0]
         ix_cols = np.where(cols_with_data)[0]
-
         x_grid = x_grid[np.ix_(ix_rows, ix_cols)]
         y_grid = y_grid[np.ix_(ix_rows, ix_cols)]
         z_grid = z_grid[np.ix_(ix_rows, ix_cols)]

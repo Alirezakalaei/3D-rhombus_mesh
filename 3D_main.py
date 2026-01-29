@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib
 
 matplotlib.use('TKAgg')
-
+from dynamics_functions import *
 import matplotlib.pyplot as plt
 
 # Import the functions from our custom module.
@@ -47,13 +47,13 @@ CRSS = .5*10**6
 app_load = 20*10**6
 mu = 46e9 #Pa
 nu = .34
-a= 1*b # singularity removal
+a= 10*b # singularity removal
 min_density_val = 1e9 #m^-2
-cutoff_dist_val = 5000*b
+cutoff_dist_val = 1000*b
 
 load_direction= np.array([0, 0, 1])
 b_vecs = calculate_tetrahedron_slip_systems(b)
-box_edge_length = 10000 * b
+box_edge_length = 20000 * b
 n_grid = np.ceil(box_edge_length / d)
 minimum_valid_points = np.ceil((n_grid*n_grid)/1)
 nthetaintervals = 360  # Example: Divide 0-360 degrees into 18 bins (20 degrees each)
@@ -221,23 +221,92 @@ interaction_stress_data = compute_interaction_stress_mura(
 # =============================================================================
 # VISUALIZATION CHECK
 # =============================================================================
-if interaction_stress_data:
-    # Example: Visualize stress for the first available system
-    first_key = list(interaction_stress_data.keys())[0]
-    data_entry = interaction_stress_data[first_key]
+## =============================================================================
+# 7. SMART VISUALIZATION: FIND ACTIVE SYSTEMS ONLY
+# =============================================================================
+print("\n--- 7. Visualizing Active Density vs Stress ---")
 
-    stress_map = data_entry['stress_field']
-    # Calculate magnitude for plotting
-    stress_mag = stress_map
+found_active_system = False
 
-    # Mask 0 values (where there is no mesh) for better visualization
-    stress_mag_masked = np.ma.masked_where(stress_mag == 0, stress_mag)
+# Iterate through all computed stress systems
+for key, stress_entry in interaction_stress_data.items():
 
-    plt.figure(figsize=(10, 8))
-    plt.imshow(stress_mag_masked, origin='lower', cmap='plasma')
-    plt.title(
-        f"Interaction Stress Magnitude\nPlane {data_entry['slip_plane_normal_id']}, Stack {data_entry['slip_plane_stack_id']}, Sys {data_entry['slip_system_id']}")
-    plt.colorbar(label='Stress Interaction (Pa)')
+    # Unpack the key
+    # key structure: (normal_id, stack_id, slip_system_id)
+    tgt_nid, tgt_sid, tgt_sysid = key
+
+    stress_map = stress_entry['stress_field']
+
+    # 1. FILTER: Check if this system has any significant stress
+    # If the maximum absolute stress is negligible, skip it.
+    if np.max(np.abs(stress_map)) < 1.0:
+        continue
+
+    # 2. AGGREGATE DENSITY: Find density on this specific plane (Normal/Stack)
+    # We need to sum up density from all loops that exist on this specific plane
+    density_2d_total = np.zeros_like(stress_map)
+    has_density = False
+
+    for loop_key, loop_data in QQ_coarse.items():
+        if loop_data['normal_id'] == tgt_nid and loop_data['stack_id'] == tgt_sid:
+            # Sum the 3D density (x, y, theta) over theta to get 2D spatial density
+            # Using nansum to handle potential NaNs safely
+            density_2d_total += np.nansum(loop_data['density_map'], axis=2)
+            has_density = True
+
+    # 3. FILTER: Check if there is actually density here
+    if not has_density or np.max(density_2d_total) < 1e-5:
+        continue
+
+    # =========================================================================
+    # PLOTTING
+    # =========================================================================
+    print(f"Found Active System!")
+    print(f"  > Plane Normal ID: {tgt_nid}")
+    print(f"  > Plane Stack ID:  {tgt_sid}")
+    print(f"  > Slip System ID:  {tgt_sysid}")
+
+    found_active_system = True
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+    # --- Plot A: Dislocation Density ---
+    # Mask values near zero for a transparent background
+    dens_masked = np.ma.masked_where(density_2d_total <= 1e-12, density_2d_total)
+
+    im1 = axes[0].imshow(dens_masked, origin='lower', cmap='viridis', interpolation='nearest')
+    axes[0].set_title(f"Total Dislocation Density\n(Normal {tgt_nid}, Stack {tgt_sid})")
+    axes[0].set_xlabel("Grid X")
+    axes[0].set_ylabel("Grid Y")
+    cbar1 = plt.colorbar(im1, ax=axes[0])
+    cbar1.set_label(r'Density $\rho$ ($m^{-2}$)')
+
+    # --- Plot B: Interaction Stress (RSS) ---
+    # Mask 0 values (areas outside the mesh)
+    stress_masked = np.ma.masked_where(stress_map == 0, stress_map)
+
+    # Determine symmetric color limits for stress centered on 0
+    limit = np.max(np.abs(stress_masked))
+
+    im2 = axes[1].imshow(stress_masked, origin='lower', cmap='coolwarm', vmin=-limit, vmax=limit)
+    axes[1].set_title(f"Interaction Stress (RSS)\n(Slip System {tgt_sysid})")
+    axes[1].set_xlabel("Grid X")
+    axes[1].set_ylabel("Grid Y")
+    cbar2 = plt.colorbar(im2, ax=axes[1])
+    cbar2.set_label('Resolved Shear Stress (Pa)')
+
+    plt.tight_layout()
     plt.show()
 
-    print(f"Computed stress for {len(interaction_stress_data)} target systems.")
+    # Stop after finding the first valid one so we don't get 50 popups
+    break
+
+if not found_active_system:
+    print("No systems found with both significant density and stress.")
+    print("Check your target_density, loops generation, or stress cutoff parameters.")
+################################################################################################
+## dynamics section
+#In this section we put all the functions and computation needed for dynamics simulation in 3D ADD with rhombus mesh structure
+
+
+stress_map = compute_effective_stress(interaction_stress_data, load_direction, app_load, CRSS, b_vecs)
